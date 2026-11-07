@@ -921,6 +921,7 @@ class PlexZaprosBot(Plugin):
             SELECT id, title, status, requester_id, created_at, last_checked_at,
                    last_check_message, plex_title
             FROM movie_requests
+            WHERE status = 'pending'
             ORDER BY created_at DESC
             LIMIT $1
             """,
@@ -948,7 +949,7 @@ class PlexZaprosBot(Plugin):
             return
 
         blocks = [
-            "**Запросы фильмов**",
+            "**Запросы фильмов** (только ожидающие)",
             f"(до {per_user} на пользователя, до {users_max} пользователей)",
             "",
         ]
