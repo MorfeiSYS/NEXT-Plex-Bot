@@ -882,7 +882,7 @@ class PlexZaprosBot(Plugin):
         await self._deliver(
             str(evt.sender),
             str(evt.room_id),
-            f"Фильм «{title}» на Plex не найден. Запрос сохранён"
+            f"⛔️ Фильм «{title}» на Plex не найден. Запрос сохранён"
             f"{f' (#{req_id})' if req_id else ''}; повторная проверка каждые "
             f"{self._conf('poll_interval_hours', 6)} ч.",
             in_room=evt,
