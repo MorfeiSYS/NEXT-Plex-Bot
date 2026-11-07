@@ -16,6 +16,12 @@ poll_interval_hours: 6
 poll_startup_seconds: 15
 poll_between_pending_seconds: 2
 search_limit: 10
+# Макс. позиций в списке при нескольких похожих результатах !zapros
+search_results_max: 5
+# Смещение времени в сообщениях (часы от UTC), напр. 9 для UTC+9, 6 для UTC+6
+timezone_offset_hours: 0
+# Макс. длина названия в !zapros (символов, в БД и Plex); допустимо в конфиге: 10–100
+title_max_length: 100
 queue_summary:
   updated_at: null
   pending_count: 0

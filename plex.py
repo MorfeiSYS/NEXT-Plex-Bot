@@ -42,6 +42,45 @@ def normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", title.strip().lower())
 
 
+_YEAR_PAREN_RE = re.compile(r"\s*\((\d{4})\)\s*$")
+_YEAR_TAIL_RE = re.compile(r"\s+(\d{4})\s*$")
+
+
+def parse_movie_query(text: str) -> tuple[str, Optional[int]]:
+    """Извлекает год (4 цифры в конце или в скобках) и оставшееся название."""
+    text = text.strip()
+    year: Optional[int] = None
+    def _film_year(raw: str) -> Optional[int]:
+        y = _parse_year(raw)
+        if y is not None and 1888 <= y <= 2100:
+            return y
+        return None
+
+    m = _YEAR_PAREN_RE.search(text)
+    if m:
+        year = _film_year(m.group(1))
+        if year is not None:
+            text = text[: m.start()].strip()
+        else:
+            year = None
+    else:
+        m = _YEAR_TAIL_RE.search(text)
+        if m:
+            year = _film_year(m.group(1))
+            if year is not None:
+                text = text[: m.start()].strip()
+            else:
+                year = None
+    return text, year
+
+
+def plex_search_query(title: str, year: Optional[int]) -> str:
+    title = title.strip()
+    if year is None:
+        return title
+    return f"{title} {year}"
+
+
 def _parse_year(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -91,32 +130,88 @@ def _score_match(query_norm: str, title: str) -> int:
     return 10
 
 
-def pick_best_movie(query: str, items: list[dict]) -> Optional[PlexMovie]:
-    if not items:
-        return None
-    q = normalize_title(query)
-    best: Optional[tuple[int, PlexMovie]] = None
+def _score_movie(
+    query_norm: str, movie: PlexMovie, requested_year: Optional[int]
+) -> int:
+    score = _score_match(query_norm, movie.title)
+    if requested_year is not None and movie.year is not None:
+        if movie.year == requested_year:
+            score += 25
+        else:
+            score -= 10
+    return score
+
+
+def _movies_from_items(items: list[dict]) -> list[PlexMovie]:
+    out: list[PlexMovie] = []
+    seen: set[str] = set()
     for item in items:
         title = item.get("title") or item.get("originalTitle")
         rating_key = item.get("ratingKey") or item.get("ratingkey")
         if not title or not rating_key:
             continue
-        movie = PlexMovie(
-            rating_key=str(rating_key),
-            title=str(title),
-            year=_parse_year(item.get("year")),
+        rk = str(rating_key)
+        if rk in seen:
+            continue
+        seen.add(rk)
+        out.append(
+            PlexMovie(
+                rating_key=rk,
+                title=str(title),
+                year=_parse_year(item.get("year")),
+            )
         )
-        score = _score_match(q, movie.title)
-        if best is None or score > best[0]:
-            best = (score, movie)
-    if best and best[0] >= 70:
-        return best[1]
-    if best and best[0] >= 10:
-        return best[1]
-    return None
+    return out
 
 
-async def search_movie(
+def classify_search_results(
+    query: str,
+    items: list[dict],
+    *,
+    requested_year: Optional[int] = None,
+    min_similar: int = 70,
+) -> tuple[list[PlexMovie], bool]:
+    """(список для ответа, True если несколько похожих — показывать таблицу)."""
+    if not items:
+        return [], False
+    q = normalize_title(query)
+    scored: list[tuple[int, PlexMovie]] = []
+    for movie in _movies_from_items(items):
+        score = _score_movie(q, movie, requested_year)
+        if score < 10:
+            continue
+        scored.append((score, movie))
+    scored.sort(key=lambda x: (-x[0], x[1].title.lower()))
+    if not scored:
+        return [], False
+
+    similar = [m for s, m in scored if s >= min_similar]
+    if requested_year is not None:
+        year_hits = [m for m in similar if m.year == requested_year]
+        if len(year_hits) == 1:
+            return year_hits, False
+        if len(year_hits) > 1:
+            return year_hits, True
+        # Год задан, но среди похожих нет фильма с этим годом
+        return [], False
+
+    if len(similar) > 1:
+        return similar, True
+    if len(similar) == 1:
+        return similar, False
+    return [scored[0][1]], False
+
+
+def pick_best_movie(
+    query: str, items: list[dict], *, requested_year: Optional[int] = None
+) -> Optional[PlexMovie]:
+    movies, _ambiguous = classify_search_results(
+        query, items, requested_year=requested_year
+    )
+    return movies[0] if movies else None
+
+
+async def _plex_hubs_search(
     session: aiohttp.ClientSession,
     *,
     base_url: str,
@@ -124,7 +219,7 @@ async def search_movie(
     client_identifier: str,
     query: str,
     limit: int = 10,
-) -> Optional[PlexMovie]:
+) -> list[dict]:
     if not token:
         raise PlexError("Plex token не задан в config плагина.")
     if not query.strip():
@@ -152,5 +247,46 @@ async def search_movie(
 
     if not isinstance(data, dict):
         raise PlexError("Неожиданный ответ Plex (не JSON-объект).")
-    items = _iter_movie_metadata(data)
-    return pick_best_movie(query, items)
+    return _iter_movie_metadata(data)
+
+
+async def search_movie_items(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    token: str,
+    client_identifier: str,
+    query: str,
+    limit: int = 10,
+    requested_year: Optional[int] = None,
+) -> tuple[list[PlexMovie], bool]:
+    items = await _plex_hubs_search(
+        session,
+        base_url=base_url,
+        token=token,
+        client_identifier=client_identifier,
+        query=query,
+        limit=limit,
+    )
+    return classify_search_results(query, items, requested_year=requested_year)
+
+
+async def search_movie(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    token: str,
+    client_identifier: str,
+    query: str,
+    limit: int = 10,
+    requested_year: Optional[int] = None,
+) -> Optional[PlexMovie]:
+    items = await _plex_hubs_search(
+        session,
+        base_url=base_url,
+        token=token,
+        client_identifier=client_identifier,
+        query=query,
+        limit=limit,
+    )
+    return pick_best_movie(query, items, requested_year=requested_year)

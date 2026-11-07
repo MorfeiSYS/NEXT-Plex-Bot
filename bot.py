@@ -12,10 +12,22 @@ from mautrix.types import EventType, RoomCreatePreset
 from mautrix.util.async_db import Scheme, UpgradeTable
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
-from plex import PlexError, PlexMovie, normalize_title, search_movie
+from plex import (
+    PlexError,
+    PlexMovie,
+    normalize_title,
+    parse_movie_query,
+    search_movie,
+    search_movie_items,
+)
 
 upgrade_table = UpgradeTable()
 _TITLE_QUOTED_RE = re.compile(r'^"([^"]+)"\s*$|\'([^\']+)\'\s*$')
+_TITLE_QUOTED_YEAR_SUFFIX_RE = re.compile(
+    r'^["\']([^"\']+)["\'](\s*\(\d{4}\)|\s+\d{4})\s*$'
+)
+_DB_DISPLAY_UNSAFE_RE = re.compile(r"<[^>]*>")
+_DB_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _utc_now() -> datetime:
@@ -42,15 +54,51 @@ def _status_ru(status: str) -> str:
     return status
 
 
-def _fmt_ts_short(value) -> str:
+def _parse_utc_ts(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _sanitize_db_display(value) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    text = _DB_CONTROL_CHARS_RE.sub("", text)
+    text = _DB_DISPLAY_UNSAFE_RE.sub("", text)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "")
+        .replace(">", "")
+        .replace('"', "&quot;")
+    )
+
+
+def _fmt_ts_short(value, offset_hours: float = 0) -> str:
     if value is None:
         return "—"
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d %H:%M")
-    text = str(value)
-    if len(text) >= 16:
-        return text[:16].replace("T", " ")
-    return text
+    dt = _parse_utc_ts(value)
+    if dt is None:
+        text = str(value)
+        if len(text) >= 16:
+            return text[:16].replace("T", " ")
+        return text
+    shifted = dt + timedelta(hours=offset_hours)
+    return shifted.strftime("%Y-%m-%d %H:%M")
 
 
 @upgrade_table.register(description="Initial revision")
@@ -132,6 +180,9 @@ class Config(BaseProxyConfig):
         helper.copy("poll_startup_seconds")
         helper.copy("poll_between_pending_seconds")
         helper.copy("search_limit")
+        helper.copy("search_results_max")
+        helper.copy("timezone_offset_hours")
+        helper.copy("title_max_length")
         for key in ("queue_summary", "movie_requests"):
             if key in self:
                 helper.base[key] = self[key]
@@ -181,6 +232,12 @@ class PlexZaprosBot(Plugin):
     def _conf(self, key: str, default):
         return self.config.get(key, default)
 
+    def _timezone_offset_hours(self) -> float:
+        try:
+            return float(self._conf("timezone_offset_hours", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _plex_str(self, key: str, default: str) -> str:
         plex = self._conf("plex", {})
         if not plex:
@@ -210,12 +267,41 @@ class PlexZaprosBot(Plugin):
 
     def _parse_movie_title(self, body: str) -> Optional[str]:
         body = body.strip()
+        m = _TITLE_QUOTED_YEAR_SUFFIX_RE.match(body)
+        if m:
+            return f"{m.group(1).strip()}{m.group(2)}"
         m = _TITLE_QUOTED_RE.match(body)
         if m:
             return (m.group(1) or m.group(2) or "").strip()
         if body and not body.lower().startswith("list"):
             return body
         return None
+
+    def _search_results_max(self) -> int:
+        try:
+            return max(1, min(50, int(self._conf("search_results_max", 5))))
+        except (TypeError, ValueError):
+            return 5
+
+    def _title_max_length(self) -> int:
+        try:
+            n = int(self._conf("title_max_length", 100))
+        except (TypeError, ValueError):
+            n = 100
+        return max(10, min(100, n))
+
+    def _format_movies_table(self, movies: list[PlexMovie], requested: str) -> str:
+        lines = [f"Найдено несколько похожих фильмов для «{requested}»:", ""]
+        for i, m in enumerate(movies, 1):
+            year = str(m.year) if m.year else "—"
+            lines.append(f"{i}. {m.title} ({year})")
+        lines.extend(
+            [
+                "",
+                'Уточните запрос, напр.: !zapros "Матрица 1999" или "Матрица (1999)".',
+            ]
+        )
+        return "\n".join(lines)
 
     def _format_found(self, movie: PlexMovie, requested: str) -> str:
         year = f" ({movie.year})" if movie.year else ""
@@ -240,6 +326,9 @@ class PlexZaprosBot(Plugin):
         check_message: str,
     ) -> None:
         now = _db_now()
+        safe_title = _sanitize_db_display(title) or title
+        safe_plex_title = _sanitize_db_display(movie.title) or movie.title
+        safe_msg = _sanitize_db_display(check_message) or check_message
         await self.database.execute(
             """
             INSERT INTO movie_requests (
@@ -248,27 +337,43 @@ class PlexZaprosBot(Plugin):
                 plex_rating_key, plex_title, plex_year, last_check_message
             ) VALUES ($1,$2,$3,$4,'found',$5,$5,$5,$6,$7,$8,$9)
             """,
-            title,
+            safe_title,
             normalize_title(title),
             requester,
             room_id,
             now,
             movie.rating_key,
-            movie.title,
+            safe_plex_title,
             movie.year,
-            check_message,
+            safe_msg,
+        )
+
+    def _plex_search_kwargs(self, title: str) -> dict:
+        name, year = parse_movie_query(title)
+        limit = int(self._conf("search_limit", 10))
+        # Plex hubs/search надёжнее по одному названию; год — при выборе из выдачи
+        return dict(
+            session=self.http,
+            base_url=self._plex_str("base_url", "http://127.0.0.1:32400"),
+            token=self._plex_str("token", ""),
+            client_identifier=self._plex_str(
+                "client_identifier", "maubot-plex-zapros"
+            ),
+            query=name,
+            limit=limit,
+            requested_year=year,
         )
 
     async def _search_plex(self, title: str) -> Optional[PlexMovie]:
-        limit = int(self._conf("search_limit", 10))
-        return await search_movie(
-            self.http,
-            base_url=self._plex_str("base_url", "http://127.0.0.1:32400"),
-            token=self._plex_str("token", ""),
-            client_identifier=self._plex_str("client_identifier", "maubot-plex-zapros"),
-            query=title,
-            limit=limit,
-        )
+        return await search_movie(**self._plex_search_kwargs(title))
+
+    async def _search_plex_interactive(
+        self, title: str
+    ) -> tuple[list[PlexMovie], bool]:
+        movies, ambiguous = await search_movie_items(**self._plex_search_kwargs(title))
+        if ambiguous:
+            movies = movies[: self._search_results_max()]
+        return movies, ambiguous
 
     async def _is_direct_with(self, user_id: str, room_id: str) -> bool:
         bot = str(self.client.mxid)
@@ -344,6 +449,7 @@ class PlexZaprosBot(Plugin):
         text: str,
         *,
         in_room: Optional[MessageEvent] = None,
+        markdown: bool = True,
     ) -> None:
         mode = str(self._conf("reply_mode", "room")).lower()
         if mode == "dm":
@@ -351,7 +457,7 @@ class PlexZaprosBot(Plugin):
                 rid = str(in_room.room_id)
                 if await self._is_direct_with(user_id, rid):
                     self._dm_rooms[user_id] = rid
-                    await in_room.respond(text)
+                    await in_room.respond(text, markdown=markdown)
                     return
             await self._send_dm(user_id, text)
             if in_room is not None and str(in_room.sender) == user_id:
@@ -363,7 +469,7 @@ class PlexZaprosBot(Plugin):
                     )
             return
         if in_room is not None:
-            await in_room.respond(text)
+            await in_room.respond(text, markdown=markdown)
             return
         await self.client.send_text(room_id, text)
 
@@ -462,6 +568,8 @@ class PlexZaprosBot(Plugin):
         self, title: str, requester: str, room_id: str, check_message: str
     ) -> Optional[int]:
         title_norm = normalize_title(title)
+        safe_title = _sanitize_db_display(title) or title
+        safe_msg = _sanitize_db_display(check_message) or check_message
         row = await self.database.fetchrow(
             """
             SELECT id FROM movie_requests
@@ -479,7 +587,7 @@ class PlexZaprosBot(Plugin):
                 WHERE id=$3
                 """,
                 now,
-                check_message,
+                safe_msg,
                 row["id"],
             )
             return int(row["id"])
@@ -492,12 +600,12 @@ class PlexZaprosBot(Plugin):
             ) VALUES ($1,$2,$3,$4,'pending',$5,$5,$6)
             RETURNING id
             """,
-            title,
+            safe_title,
             title_norm,
             requester,
             room_id,
             now,
-            check_message,
+            safe_msg,
         )
         return int(row["id"]) if row else None
 
@@ -519,13 +627,15 @@ class PlexZaprosBot(Plugin):
             items.append(
                 {
                     "id": r["id"],
-                    "title": r["title"],
-                    "status": r["status"],
-                    "requester_id": r["requester_id"],
+                    "title": _sanitize_db_display(r["title"]),
+                    "status": _sanitize_db_display(r["status"]),
+                    "requester_id": _sanitize_db_display(r["requester_id"]),
                     "created_at": _iso_ts(r["created_at"]),
                     "last_checked_at": _iso_ts(r["last_checked_at"]),
-                    "last_check_message": r["last_check_message"],
-                    "plex_title": r["plex_title"],
+                    "last_check_message": _sanitize_db_display(
+                        r["last_check_message"]
+                    ),
+                    "plex_title": _sanitize_db_display(r["plex_title"]),
                 }
             )
         snapshot = {
@@ -572,7 +682,7 @@ class PlexZaprosBot(Plugin):
                 WHERE id=$3
                 """,
                 now,
-                str(e),
+                _sanitize_db_display(str(e)),
                 row["id"],
             )
             return
@@ -600,7 +710,7 @@ class PlexZaprosBot(Plugin):
             """,
             now,
             movie.rating_key,
-            movie.title,
+            _sanitize_db_display(movie.title),
             movie.year,
             "Найден при периодической проверке",
             row["id"],
@@ -655,7 +765,9 @@ class PlexZaprosBot(Plugin):
     async def _zapros_cmd(self, evt: MessageEvent, body: Optional[str]) -> None:
         raw = (body or "").strip()
         if not raw:
-            await evt.respond('Использование: !zapros "Название фильма"')
+            await evt.respond(
+                'Использование: !zapros "Название" или "Название 2020" / "Название (2020)"'
+            )
             return
         if raw.lower() == "list" or raw.lower().startswith("list "):
             if not self._is_operator(evt):
@@ -667,11 +779,29 @@ class PlexZaprosBot(Plugin):
         if not title:
             await evt.respond('Укажите название в кавычках: !zapros "Название фильма"')
             return
+        limit = self._title_max_length()
+        if len(title.strip()) > limit:
+            await evt.respond(
+                f"Слишком длинное название ({len(title.strip())} симв.). "
+                f"Максимум {limit} симв."
+            )
+            return
+        title = title.strip()
         try:
-            movie = await self._search_plex(title)
+            movies, ambiguous = await self._search_plex_interactive(title)
         except PlexError as e:
             await evt.respond(str(e))
             return
+        if ambiguous and movies:
+            await self._deliver(
+                str(evt.sender),
+                str(evt.room_id),
+                self._format_movies_table(movies, title),
+                in_room=evt,
+                markdown=False,
+            )
+            return
+        movie = movies[0] if movies else None
         if movie:
             await self._record_found(
                 title,
@@ -718,8 +848,9 @@ class PlexZaprosBot(Plugin):
         return requester_id
 
     def _list_entry_line(self, r) -> str:
-        created = _fmt_ts_short(r["created_at"]) if r["created_at"] else "?"
-        checked = _fmt_ts_short(r["last_checked_at"])
+        tz = self._timezone_offset_hours()
+        created = _fmt_ts_short(r["created_at"], tz) if r["created_at"] else "?"
+        checked = _fmt_ts_short(r["last_checked_at"], tz)
         st = _status_ru(str(r["status"]))
         if r["status"] == "found" and r["plex_title"]:
             tail = f"Plex: «{r['plex_title']}»"
