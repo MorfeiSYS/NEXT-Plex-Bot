@@ -44,12 +44,14 @@ def normalize_title(title: str) -> str:
 
 _YEAR_PAREN_RE = re.compile(r"\s*\((\d{4})\)\s*$")
 _YEAR_TAIL_RE = re.compile(r"\s+(\d{4})\s*$")
+_YEAR_GLUED_RE = re.compile(r"^(.+)(\d{4})$")
 
 
 def parse_movie_query(text: str) -> tuple[str, Optional[int]]:
-    """Извлекает год (4 цифры в конце или в скобках) и оставшееся название."""
+    """Извлекает год (скобки, пробел, слитно в конце) и оставшееся название."""
     text = text.strip()
     year: Optional[int] = None
+
     def _film_year(raw: str) -> Optional[int]:
         y = _parse_year(raw)
         if y is not None and 1888 <= y <= 2100:
@@ -63,14 +65,18 @@ def parse_movie_query(text: str) -> tuple[str, Optional[int]]:
             text = text[: m.start()].strip()
         else:
             year = None
-    else:
-        m = _YEAR_TAIL_RE.search(text)
-        if m:
-            year = _film_year(m.group(1))
-            if year is not None:
-                text = text[: m.start()].strip()
-            else:
-                year = None
+    elif (m := _YEAR_TAIL_RE.search(text)):
+        year = _film_year(m.group(1))
+        if year is not None:
+            text = text[: m.start()].strip()
+        else:
+            year = None
+    elif (m := _YEAR_GLUED_RE.match(text)):
+        cand_year = _film_year(m.group(2))
+        name = m.group(1).strip()
+        if cand_year is not None and name and not name[-1].isdigit():
+            year = cand_year
+            text = name
     return text, year
 
 

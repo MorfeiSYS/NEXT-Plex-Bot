@@ -26,6 +26,7 @@ _TITLE_QUOTED_RE = re.compile(r'^"([^"]+)"\s*$|\'([^\']+)\'\s*$')
 _TITLE_QUOTED_YEAR_SUFFIX_RE = re.compile(
     r'^["\']([^"\']+)["\'](\s*\(\d{4}\)|\s+\d{4})\s*$'
 )
+_ZAPROS_DUP_RE = re.compile(r"!zapros\b", re.IGNORECASE)
 _DB_DISPLAY_UNSAFE_RE = re.compile(r"<[^>]*>")
 _DB_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -566,7 +567,8 @@ class PlexZaprosBot(Plugin):
 
     async def _insert_pending(
         self, title: str, requester: str, room_id: str, check_message: str
-    ) -> Optional[int]:
+    ) -> tuple[Optional[int], bool]:
+        """(id, is_new) — is_new False, если уже был pending для пары title+пользователь."""
         title_norm = normalize_title(title)
         safe_title = _sanitize_db_display(title) or title
         safe_msg = _sanitize_db_display(check_message) or check_message
@@ -590,7 +592,7 @@ class PlexZaprosBot(Plugin):
                 safe_msg,
                 row["id"],
             )
-            return int(row["id"])
+            return int(row["id"]), False
         now = _db_now()
         row = await self.database.fetchrow(
             """
@@ -607,7 +609,9 @@ class PlexZaprosBot(Plugin):
             now,
             safe_msg,
         )
-        return int(row["id"]) if row else None
+        if row:
+            return int(row["id"]), True
+        return None, False
 
     async def refresh_queue_summary(self) -> None:
         pending_count = await self.database.fetchval(
@@ -769,6 +773,12 @@ class PlexZaprosBot(Plugin):
                 'Использование: !zapros "Название" или "Название 2020" / "Название (2020)"'
             )
             return
+        if _ZAPROS_DUP_RE.search(raw):
+            await evt.respond(
+                "Некорректный запрос: в сообщении повторяется команда !zapros. "
+                'Отправьте один запрос, например: !zapros "Название фильма"'
+            )
+            return
         if raw.lower() == "list" or raw.lower().startswith("list "):
             if not self._is_operator(evt):
                 await evt.respond("Команда list доступна только операторам из notify_users.")
@@ -818,13 +828,13 @@ class PlexZaprosBot(Plugin):
             )
             await self.refresh_queue_summary()
             return
-        req_id = await self._insert_pending(
+        req_id, is_new = await self._insert_pending(
             title,
             str(evt.sender),
             str(evt.room_id),
             "Не найден при первичной проверке",
         )
-        if req_id is not None:
+        if is_new and req_id is not None:
             await self._notify_operators_new_request(
                 title, str(evt.sender), str(evt.room_id), req_id
             )
