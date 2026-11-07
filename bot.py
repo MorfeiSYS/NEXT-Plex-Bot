@@ -8,7 +8,14 @@ from typing import Optional, Type
 
 from maubot import Plugin, MessageEvent
 from maubot.handlers import command
-from mautrix.types import EventType, RoomCreatePreset
+from maubot.matrix import parse_formatted
+from mautrix.types import (
+    EventType,
+    Format,
+    MessageType,
+    RoomCreatePreset,
+    TextMessageEventContent,
+)
 from mautrix.util.async_db import Scheme, UpgradeTable
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
@@ -184,6 +191,8 @@ class Config(BaseProxyConfig):
         helper.copy("search_results_max")
         helper.copy("timezone_offset_hours")
         helper.copy("title_max_length")
+        helper.copy("list_per_user_max")
+        helper.copy("list_users_max")
         for key in ("queue_summary", "movie_requests"):
             if key in self:
                 helper.base[key] = self[key]
@@ -291,6 +300,20 @@ class PlexZaprosBot(Plugin):
             n = 100
         return max(10, min(100, n))
 
+    def _list_per_user_max(self) -> int:
+        try:
+            n = int(self._conf("list_per_user_max", 5))
+        except (TypeError, ValueError):
+            n = 5
+        return max(1, min(50, n))
+
+    def _list_users_max(self) -> int:
+        try:
+            n = int(self._conf("list_users_max", 10))
+        except (TypeError, ValueError):
+            n = 10
+        return max(1, min(50, n))
+
     def _format_movies_table(self, movies: list[PlexMovie], requested: str) -> str:
         lines = [f"Найдено несколько похожих фильмов для «{requested}»:", ""]
         for i, m in enumerate(movies, 1):
@@ -307,14 +330,14 @@ class PlexZaprosBot(Plugin):
     def _format_found(self, movie: PlexMovie, requested: str) -> str:
         year = f" ({movie.year})" if movie.year else ""
         return (
-            f"Фильм «{movie.title}»{year} найден на Plex "
+            f"✅ Фильм «{movie.title}»{year} найден на Plex "
             f"(запрос: «{requested}»)."
         )
 
     def _format_found_later(self, movie: PlexMovie, requested: str) -> str:
         year = f" ({movie.year})" if movie.year else ""
         return (
-            f"Запрошенный фильм «{requested}» теперь есть на Plex: "
+            f"✅ Запрошенный фильм «{requested}» теперь есть на Plex: "
             f"«{movie.title}»{year}."
         )
 
@@ -443,6 +466,22 @@ class PlexZaprosBot(Plugin):
                 return rid
         return None
 
+    async def _send_room_text(
+        self, room_id: str, text: str, *, markdown: bool = True
+    ) -> None:
+        rid = str(room_id)
+        if markdown:
+            body, html = await parse_formatted(text, render_markdown=True)
+            content = TextMessageEventContent(
+                msgtype=MessageType.TEXT,
+                body=body,
+                format=Format.HTML,
+                formatted_body=html,
+            )
+            await self.client.send_message_event(rid, EventType.ROOM_MESSAGE, content)
+        else:
+            await self.client.send_text(rid, text)
+
     async def _deliver(
         self,
         user_id: str,
@@ -460,7 +499,7 @@ class PlexZaprosBot(Plugin):
                     self._dm_rooms[user_id] = rid
                     await in_room.respond(text, markdown=markdown)
                     return
-            await self._send_dm(user_id, text)
+            await self._send_dm(user_id, text, markdown=markdown)
             if in_room is not None and str(in_room.sender) == user_id:
                 src = str(in_room.room_id)
                 dm = await self._dm_room_for(user_id)
@@ -472,9 +511,11 @@ class PlexZaprosBot(Plugin):
         if in_room is not None:
             await in_room.respond(text, markdown=markdown)
             return
-        await self.client.send_text(room_id, text)
+        await self._send_room_text(room_id, text, markdown=markdown)
 
-    async def _send_dm(self, user_id: str, text: str) -> None:
+    async def _send_dm(
+        self, user_id: str, text: str, *, markdown: bool = True
+    ) -> None:
         room_id = await self._dm_room_for(user_id)
         if not room_id:
             room_id = await self.client.create_room(
@@ -483,7 +524,7 @@ class PlexZaprosBot(Plugin):
                 is_direct=True,
             )
             self._dm_rooms[user_id] = str(room_id)
-        await self.client.send_text(room_id, text)
+        await self._send_room_text(room_id, text, markdown=markdown)
 
     async def _operator_notify_room(
         self, request_room_id: str, requester: str
@@ -781,7 +822,7 @@ class PlexZaprosBot(Plugin):
             return
         if raw.lower() == "list" or raw.lower().startswith("list "):
             if not self._is_operator(evt):
-                await evt.respond("Команда list доступна только операторам из notify_users.")
+                await evt.respond("Команда list доступна только операторам.")
                 return
             await self._cmd_list(evt)
             return
@@ -872,28 +913,43 @@ class PlexZaprosBot(Plugin):
         )
 
     async def _cmd_list(self, evt: MessageEvent) -> None:
+        per_user = self._list_per_user_max()
+        users_max = self._list_users_max()
+        fetch_limit = per_user * users_max
         rows = await self.database.fetch(
             """
             SELECT id, title, status, requester_id, created_at, last_checked_at,
                    last_check_message, plex_title
             FROM movie_requests
             ORDER BY created_at DESC
-            LIMIT 30
-            """
+            LIMIT $1
+            """,
+            fetch_limit,
         )
         if not rows:
             await evt.respond("Запросов пока нет.")
             return
         by_user: dict[str, list] = defaultdict(list)
         user_order: list[str] = []
+        shown = 0
         for r in rows:
             uid = str(r["requester_id"])
             if uid not in by_user:
+                if len(user_order) >= users_max:
+                    continue
                 user_order.append(uid)
+            if len(by_user[uid]) >= per_user:
+                continue
             by_user[uid].append(r)
+            shown += 1
+
+        if not shown:
+            await evt.respond("Запросов пока нет.")
+            return
 
         blocks = [
-            f"**Запросы фильмов** ({len(rows)} последних, по пользователям)",
+            "**Запросы фильмов**",
+            f"(до {per_user} на пользователя, до {users_max} пользователей)",
             "",
         ]
         for uid in user_order:

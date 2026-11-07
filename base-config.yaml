@@ -22,6 +22,9 @@ search_results_max: 5
 timezone_offset_hours: 0
 # Макс. длина названия в !zapros (символов, в БД и Plex); допустимо в конфиге: 10–100
 title_max_length: 100
+# !zapros list: макс. запросов на одного пользователя и макс. числа пользователей в ответе
+list_per_user_max: 5
+list_users_max: 10
 queue_summary:
   updated_at: null
   pending_count: 0
