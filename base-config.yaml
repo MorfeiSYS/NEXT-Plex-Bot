@@ -1,0 +1,13 @@
+plex:
+  base_url: "http://127.0.0.1:32400"
+  token: ""
+  client_identifier: "maubot-plex-zapros"
+notify_users:
+  - "@operator:example.com"
+reply_mode: room
+poll_interval_hours: 6
+search_limit: 10
+queue_summary:
+  updated_at: null
+  pending_count: 0
+  items: []
