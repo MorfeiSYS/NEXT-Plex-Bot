@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Type
 
 from maubot import Plugin, MessageEvent
 from maubot.handlers import command
-from mautrix.types import RoomCreatePreset
+from mautrix.types import EventType, RoomCreatePreset
 from mautrix.util.async_db import Scheme, UpgradeTable
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
@@ -17,27 +18,83 @@ upgrade_table = UpgradeTable()
 _TITLE_QUOTED_RE = re.compile(r'^"([^"]+)"\s*$|\'([^\']+)\'\s*$')
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _db_now() -> str:
+    return _utc_now().isoformat()
+
+
+def _iso_ts(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _status_ru(status: str) -> str:
+    if status == "found":
+        return "найден"
+    if status == "pending":
+        return "ожидает"
+    return status
+
+
+def _fmt_ts_short(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    text = str(value)
+    if len(text) >= 16:
+        return text[:16].replace("T", " ")
+    return text
+
+
 @upgrade_table.register(description="Initial revision")
 async def upgrade_v1(conn, scheme: Scheme) -> None:
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS movie_requests (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            title_norm TEXT NOT NULL,
-            requester_id TEXT NOT NULL,
-            room_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_checked_at TIMESTAMPTZ,
-            found_at TIMESTAMPTZ,
-            plex_rating_key TEXT,
-            plex_title TEXT,
-            plex_year INTEGER,
-            last_check_message TEXT
+    if scheme == Scheme.SQLITE:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS movie_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                title_norm TEXT NOT NULL,
+                requester_id TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                last_checked_at TEXT,
+                found_at TEXT,
+                plex_rating_key TEXT,
+                plex_title TEXT,
+                plex_year INTEGER,
+                last_check_message TEXT
+            )
+            """
         )
-        """
-    )
+    else:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS movie_requests (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                title_norm TEXT NOT NULL,
+                requester_id TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL,
+                last_checked_at TIMESTAMPTZ,
+                found_at TIMESTAMPTZ,
+                plex_rating_key TEXT,
+                plex_title TEXT,
+                plex_year INTEGER,
+                last_check_message TEXT
+            )
+            """
+        )
     await conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS movie_requests_pending_uq
@@ -53,23 +110,37 @@ async def upgrade_v1(conn, scheme: Scheme) -> None:
     )
 
 
+@upgrade_table.register(description="Index created_at for retention purge")
+async def upgrade_v2(conn, scheme: Scheme) -> None:
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS movie_requests_created_at_idx
+        ON movie_requests (created_at)
+        """
+    )
+
+
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         helper.copy("plex")
         helper.copy("notify_users")
         helper.copy("reply_mode")
+        helper.copy("notify_mode")
+        helper.copy("notify_room")
+        helper.copy("retention_days")
         helper.copy("poll_interval_hours")
+        helper.copy("poll_startup_seconds")
+        helper.copy("poll_between_pending_seconds")
         helper.copy("search_limit")
-        if "queue_summary" in self:
-            helper.base["queue_summary"] = self["queue_summary"]
-        elif "queue_summary" in helper.base:
-            pass
-        else:
-            helper.base["queue_summary"] = {
-                "updated_at": None,
-                "pending_count": 0,
-                "items": [],
-            }
+        for key in ("queue_summary", "movie_requests"):
+            if key in self:
+                helper.base[key] = self[key]
+            elif key not in helper.base:
+                helper.base[key] = (
+                    {"updated_at": None, "pending_count": 0, "items": []}
+                    if key == "queue_summary"
+                    else []
+                )
 
 
 class PlexZaprosBot(Plugin):
@@ -77,6 +148,7 @@ class PlexZaprosBot(Plugin):
         super().__init__(*args, **kwargs)
         self._poll_task: Optional[asyncio.Task] = None
         self._dm_rooms: dict[str, str] = {}
+        self._room_labels: dict[str, str] = {}
 
     @classmethod
     def get_db_upgrade_table(cls) -> UpgradeTable:
@@ -88,6 +160,14 @@ class PlexZaprosBot(Plugin):
 
     async def start(self) -> None:
         self.config.load_and_update()
+        try:
+            await self._purge_old_requests()
+        except Exception as e:
+            self.log.warning(f"Очистка БД при старте не удалась: {e}")
+        try:
+            await self.refresh_queue_summary()
+        except Exception as e:
+            self.log.warning(f"Не удалось обновить снимок очереди: {e}")
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def stop(self) -> None:
@@ -98,12 +178,32 @@ class PlexZaprosBot(Plugin):
             except asyncio.CancelledError:
                 pass
 
-    def _plex_cfg(self) -> dict:
-        return self.config["plex"] or {}
+    def _conf(self, key: str, default):
+        return self.config.get(key, default)
+
+    def _plex_str(self, key: str, default: str) -> str:
+        plex = self._conf("plex", {})
+        if not plex:
+            return default
+        val = plex.get(key, default)
+        if val is None or val == "":
+            return default
+        return str(val)
 
     def _notify_users(self) -> list[str]:
-        users = self.config.get("notify_users") or []
-        return [str(u) for u in users]
+        users = self._conf("notify_users", [])
+        out: list[str] = []
+        for u in users:
+            s = str(u).strip()
+            if s:
+                out.append(s)
+        return out
+
+    def _notify_mode(self) -> str:
+        explicit = self._conf("notify_mode", None)
+        if explicit is not None and str(explicit).strip():
+            return str(explicit).lower()
+        return str(self._conf("reply_mode", "room")).lower()
 
     def _is_operator(self, evt: MessageEvent) -> bool:
         return str(evt.sender) in self._notify_users()
@@ -119,23 +219,123 @@ class PlexZaprosBot(Plugin):
 
     def _format_found(self, movie: PlexMovie, requested: str) -> str:
         year = f" ({movie.year})" if movie.year else ""
-        link = movie.web_link(self._plex_cfg().get("base_url", ""))
         return (
             f"Фильм «{movie.title}»{year} найден на Plex "
-            f"(запрос: «{requested}»).\n{link}"
+            f"(запрос: «{requested}»)."
+        )
+
+    def _format_found_later(self, movie: PlexMovie, requested: str) -> str:
+        year = f" ({movie.year})" if movie.year else ""
+        return (
+            f"Запрошенный фильм «{requested}» теперь есть на Plex: "
+            f"«{movie.title}»{year}."
+        )
+
+    async def _record_found(
+        self,
+        title: str,
+        requester: str,
+        room_id: str,
+        movie: PlexMovie,
+        check_message: str,
+    ) -> None:
+        now = _db_now()
+        await self.database.execute(
+            """
+            INSERT INTO movie_requests (
+                title, title_norm, requester_id, room_id, status,
+                created_at, found_at, last_checked_at,
+                plex_rating_key, plex_title, plex_year, last_check_message
+            ) VALUES ($1,$2,$3,$4,'found',$5,$5,$5,$6,$7,$8,$9)
+            """,
+            title,
+            normalize_title(title),
+            requester,
+            room_id,
+            now,
+            movie.rating_key,
+            movie.title,
+            movie.year,
+            check_message,
         )
 
     async def _search_plex(self, title: str) -> Optional[PlexMovie]:
-        plex = self._plex_cfg()
-        limit = int(self.config.get("search_limit") or 10)
+        limit = int(self._conf("search_limit", 10))
         return await search_movie(
             self.http,
-            base_url=plex.get("base_url") or "http://127.0.0.1:32400",
-            token=plex.get("token") or "",
-            client_identifier=plex.get("client_identifier") or "maubot-plex-zapros",
+            base_url=self._plex_str("base_url", "http://127.0.0.1:32400"),
+            token=self._plex_str("token", ""),
+            client_identifier=self._plex_str("client_identifier", "maubot-plex-zapros"),
             query=title,
             limit=limit,
         )
+
+    async def _is_direct_with(self, user_id: str, room_id: str) -> bool:
+        bot = str(self.client.mxid)
+        try:
+            members = await self.client.get_joined_members(room_id)
+        except Exception:
+            return False
+        mxids = {str(m) for m in members}
+        return len(mxids) == 2 and user_id in mxids and bot in mxids
+
+    async def _room_human_label(self, room_id: str) -> str:
+        rid = str(room_id)
+        cached = self._room_labels.get(rid)
+        if cached:
+            return cached
+        name: Optional[str] = None
+        alias: Optional[str] = None
+        try:
+            ev = await self.client.get_state_event(rid, EventType.ROOM_NAME)
+            if ev.content and ev.content.name:
+                name = str(ev.content.name).strip()
+        except Exception:
+            pass
+        try:
+            ev = await self.client.get_state_event(rid, EventType.ROOM_CANONICAL_ALIAS)
+            if ev.content and ev.content.alias:
+                alias = str(ev.content.alias).strip()
+        except Exception:
+            pass
+        label: Optional[str] = None
+        if name and alias:
+            label = f"{name} ({alias})"
+        elif name:
+            label = name
+        elif alias:
+            label = alias
+        if not label:
+            bot = str(self.client.mxid)
+            try:
+                members = await self.client.get_joined_members(rid)
+                mxids = [str(m) for m in members]
+                if len(mxids) == 2 and bot in mxids:
+                    other = next(m for m in mxids if m != bot)
+                    disp = await self.client.get_displayname(other)
+                    who = (disp or "").strip() or other
+                    label = f"Личные сообщения с {who}"
+            except Exception:
+                pass
+        if not label:
+            label = f"https://matrix.to/#/{rid}"
+        self._room_labels[rid] = label
+        return label
+
+    async def _dm_room_for(self, user_id: str) -> Optional[str]:
+        cached = self._dm_rooms.get(user_id)
+        if cached:
+            return cached
+        try:
+            rooms = await self.client.get_joined_rooms()
+        except Exception:
+            return None
+        for room_id in rooms:
+            rid = str(room_id)
+            if await self._is_direct_with(user_id, rid):
+                self._dm_rooms[user_id] = rid
+                return rid
+        return None
 
     async def _deliver(
         self,
@@ -145,9 +345,22 @@ class PlexZaprosBot(Plugin):
         *,
         in_room: Optional[MessageEvent] = None,
     ) -> None:
-        mode = (self.config.get("reply_mode") or "room").lower()
+        mode = str(self._conf("reply_mode", "room")).lower()
         if mode == "dm":
+            if in_room is not None and str(in_room.sender) == user_id:
+                rid = str(in_room.room_id)
+                if await self._is_direct_with(user_id, rid):
+                    self._dm_rooms[user_id] = rid
+                    await in_room.respond(text)
+                    return
             await self._send_dm(user_id, text)
+            if in_room is not None and str(in_room.sender) == user_id:
+                src = str(in_room.room_id)
+                dm = await self._dm_room_for(user_id)
+                if dm and dm != src:
+                    await in_room.respond(
+                        "Ответ отправлен в личные сообщения с ботом."
+                    )
             return
         if in_room is not None:
             await in_room.respond(text)
@@ -155,7 +368,7 @@ class PlexZaprosBot(Plugin):
         await self.client.send_text(room_id, text)
 
     async def _send_dm(self, user_id: str, text: str) -> None:
-        room_id = self._dm_rooms.get(user_id)
+        room_id = await self._dm_room_for(user_id)
         if not room_id:
             room_id = await self.client.create_room(
                 preset=RoomCreatePreset.PRIVATE,
@@ -165,18 +378,85 @@ class PlexZaprosBot(Plugin):
             self._dm_rooms[user_id] = str(room_id)
         await self.client.send_text(room_id, text)
 
-    async def _notify_operators_new_request(
-        self, title: str, requester: str, room_id: str, request_id: int
-    ) -> None:
-        msg = (
-            f"Новый запрос контента #{request_id}: «{title}»\n"
-            f"От: {requester}\nКомната: {room_id}"
-        )
+    async def _operator_notify_room(
+        self, request_room_id: str, requester: str
+    ) -> Optional[str]:
+        """Куда постить операторское уведомление; None — только личка операторам."""
+        admin_room = str(self._conf("notify_room", "") or "").strip()
+        mode = self._notify_mode()
+        if mode == "fixed":
+            return admin_room or None
+        if mode not in ("room", "both"):
+            return None
+        if admin_room:
+            return admin_room
+        if await self._is_direct_with(requester, request_room_id):
+            return None
+        return str(request_room_id)
+
+    async def _notify_operators_dm(self, msg: str) -> None:
         for op in self._notify_users():
             try:
                 await self._send_dm(op, msg)
+                self.log.info(f"Уведомление оператору {op} (DM)")
             except Exception as e:
-                self.log.warning(f"Не удалось уведомить оператора {op}: {e}")
+                self.log.error(f"Не удалось уведомить оператора {op}: {e}")
+
+    async def _notify_operators_new_request(
+        self, title: str, requester: str, room_id: str, request_id: int
+    ) -> None:
+        ops = self._notify_users()
+        if not ops:
+            self.log.warning(
+                "notify_users пуст — уведомление о новом запросе не отправлено"
+            )
+            return
+        room_label = await self._room_human_label(room_id)
+        msg = (
+            f"Новый запрос контента #{request_id}: «{title}»\n"
+            f"От: {requester}\nКомната: {room_label}"
+        )
+        mode = self._notify_mode()
+
+        if mode not in ("dm", "room", "both", "fixed"):
+            self.log.warning(
+                f"Неизвестный notify_mode={mode!r}, ожидается "
+                "dm, room, both или fixed"
+            )
+            return
+
+        if mode == "fixed":
+            target = await self._operator_notify_room(room_id, requester)
+            if not target:
+                self.log.error(
+                    "notify_mode=fixed, но notify_room не задан — уведомление пропущено"
+                )
+                return
+            try:
+                await self.client.send_text(target, msg)
+                self.log.info(f"Уведомление операторам в комнату {target}")
+            except Exception as e:
+                self.log.error(f"Не удалось уведомить в {target}: {e}")
+            return
+
+        if mode in ("dm", "both"):
+            await self._notify_operators_dm(msg)
+
+        if mode in ("room", "both"):
+            target = await self._operator_notify_room(room_id, requester)
+            if target:
+                try:
+                    await self.client.send_text(target, msg)
+                    self.log.info(f"Уведомление операторам в комнату {target}")
+                except Exception as e:
+                    self.log.error(
+                        f"Не удалось уведомить операторов в {target}: {e}"
+                    )
+            elif mode == "room":
+                self.log.info(
+                    "Запрос из лички, notify_room не задан — дублируем в DM операторам"
+                )
+                await self._notify_operators_dm(msg)
 
     async def _insert_pending(
         self, title: str, requester: str, room_id: str, check_message: str
@@ -191,28 +471,32 @@ class PlexZaprosBot(Plugin):
             requester,
         )
         if row:
+            now = _db_now()
             await self.database.execute(
                 """
                 UPDATE movie_requests
-                SET last_checked_at=NOW(), last_check_message=$1
-                WHERE id=$2
+                SET last_checked_at=$1, last_check_message=$2
+                WHERE id=$3
                 """,
+                now,
                 check_message,
                 row["id"],
             )
             return int(row["id"])
+        now = _db_now()
         row = await self.database.fetchrow(
             """
             INSERT INTO movie_requests (
                 title, title_norm, requester_id, room_id, status,
-                last_checked_at, last_check_message
-            ) VALUES ($1,$2,$3,$4,'pending',NOW(),$5)
+                created_at, last_checked_at, last_check_message
+            ) VALUES ($1,$2,$3,$4,'pending',$5,$5,$6)
             RETURNING id
             """,
             title,
             title_norm,
             requester,
             room_id,
+            now,
             check_message,
         )
         return int(row["id"]) if row else None
@@ -238,90 +522,137 @@ class PlexZaprosBot(Plugin):
                     "title": r["title"],
                     "status": r["status"],
                     "requester_id": r["requester_id"],
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "last_checked_at": (
-                        r["last_checked_at"].isoformat() if r["last_checked_at"] else None
-                    ),
+                    "created_at": _iso_ts(r["created_at"]),
+                    "last_checked_at": _iso_ts(r["last_checked_at"]),
                     "last_check_message": r["last_check_message"],
                     "plex_title": r["plex_title"],
                 }
             )
-        self.config["queue_summary"] = {
+        snapshot = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "pending_count": int(pending_count or 0),
             "items": items,
         }
+        self.config["queue_summary"] = snapshot
+        self.config["movie_requests"] = items
         self.config.save()
+
+    async def _purge_old_requests(self) -> None:
+        days = int(self._conf("retention_days", 90))
+        if days <= 0:
+            return
+        cutoff = _utc_now() - timedelta(days=days)
+        try:
+            scheme = self.database.scheme
+        except AttributeError:
+            scheme = Scheme.POSTGRES
+        cutoff_arg = cutoff.isoformat() if scheme == Scheme.SQLITE else cutoff
+        try:
+            result = await self.database.execute(
+                "DELETE FROM movie_requests WHERE created_at < $1",
+                cutoff_arg,
+            )
+            if result:
+                self.log.info(
+                    f"Очистка БД: удалены записи старше {days} дн. ({result})"
+                )
+        except Exception as e:
+            self.log.error(f"Ошибка очистки БД (retention): {e}")
 
     async def _process_pending_row(self, row) -> None:
         title = row["title"]
         try:
             movie = await self._search_plex(title)
         except PlexError as e:
+            now = _db_now()
             await self.database.execute(
                 """
                 UPDATE movie_requests
-                SET last_checked_at=NOW(), last_check_message=$1
-                WHERE id=$2
+                SET last_checked_at=$1, last_check_message=$2
+                WHERE id=$3
                 """,
+                now,
                 str(e),
                 row["id"],
             )
             return
         if not movie:
+            now = _db_now()
             await self.database.execute(
                 """
                 UPDATE movie_requests
-                SET last_checked_at=NOW(), last_check_message=$1
-                WHERE id=$2
+                SET last_checked_at=$1, last_check_message=$2
+                WHERE id=$3
                 """,
+                now,
                 "На сервере не найден",
                 row["id"],
             )
             return
+        now = _db_now()
         await self.database.execute(
             """
             UPDATE movie_requests
-            SET status='found', found_at=NOW(), last_checked_at=NOW(),
-                plex_rating_key=$1, plex_title=$2, plex_year=$3,
-                last_check_message=$4
-            WHERE id=$5
+            SET status='found', found_at=$1, last_checked_at=$1,
+                plex_rating_key=$2, plex_title=$3, plex_year=$4,
+                last_check_message=$5
+            WHERE id=$6
             """,
+            now,
             movie.rating_key,
             movie.title,
             movie.year,
             "Найден при периодической проверке",
             row["id"],
         )
-        text = (
-            f"Запрошенный фильм «{title}» теперь есть на Plex: "
-            f"«{movie.title}»"
-            f"{f' ({movie.year})' if movie.year else ''}.\n"
-            f"{movie.web_link(self._plex_cfg().get('base_url', ''))}"
+        await self._deliver(
+            row["requester_id"],
+            row["room_id"],
+            self._format_found_later(movie, title),
         )
-        await self._deliver(row["requester_id"], row["room_id"], text)
+
+    def _poll_gap_seconds(self) -> float:
+        return max(0.0, float(self._conf("poll_between_pending_seconds", 2)))
+
+    def _poll_startup_seconds(self) -> float:
+        return max(0.0, float(self._conf("poll_startup_seconds", 15)))
 
     async def _poll_loop(self) -> None:
-        await asyncio.sleep(15)
+        await asyncio.sleep(self._poll_startup_seconds())
+        gap = self._poll_gap_seconds()
         while True:
             try:
                 rows = await self.database.fetch(
                     "SELECT * FROM movie_requests WHERE status='pending' ORDER BY id"
                 )
-                for row in rows:
+                for i, row in enumerate(rows):
                     await self._process_pending_row(row)
-                    await asyncio.sleep(2)
+                    if i + 1 < len(rows) and gap > 0:
+                        await asyncio.sleep(gap)
+                await self._purge_old_requests()
                 await self.refresh_queue_summary()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.log.error(f"Ошибка в цикле опроса Plex: {e}")
-            hours = float(self.config.get("poll_interval_hours") or 6)
+            hours = float(self._conf("poll_interval_hours", 6))
             await asyncio.sleep(max(60.0, hours * 3600.0))
 
     @command.new("zapros", require_subcommand=False)
     @command.argument("body", pass_raw=True, required=False)
     async def zapros_cmd(self, evt: MessageEvent, body: Optional[str]) -> None:
+        self.log.info(
+            f"!zapros от {evt.sender} в {evt.room_id}: {(body or '')[:80]!r}"
+        )
+        try:
+            await self._zapros_cmd(evt, body)
+        except Exception as e:
+            self.log.exception(f"Ошибка при обработке !zapros: {e}")
+            await evt.respond(
+                "Внутренняя ошибка при обработке запроса. Проверьте логи инстанса."
+            )
+
+    async def _zapros_cmd(self, evt: MessageEvent, body: Optional[str]) -> None:
         raw = (body or "").strip()
         if not raw:
             await evt.respond('Использование: !zapros "Название фильма"')
@@ -342,6 +673,13 @@ class PlexZaprosBot(Plugin):
             await evt.respond(str(e))
             return
         if movie:
+            await self._record_found(
+                title,
+                str(evt.sender),
+                str(evt.room_id),
+                movie,
+                "Найден при запросе",
+            )
             await self._deliver(
                 str(evt.sender),
                 str(evt.room_id),
@@ -365,10 +703,32 @@ class PlexZaprosBot(Plugin):
             str(evt.room_id),
             f"Фильм «{title}» на Plex не найден. Запрос сохранён"
             f"{f' (#{req_id})' if req_id else ''}; повторная проверка каждые "
-            f"{self.config.get('poll_interval_hours', 6)} ч.",
+            f"{self._conf('poll_interval_hours', 6)} ч.",
             in_room=evt,
         )
         await self.refresh_queue_summary()
+
+    async def _requester_label(self, requester_id: str) -> str:
+        try:
+            disp = await self.client.get_displayname(requester_id)
+        except Exception:
+            disp = None
+        if disp and str(disp).strip():
+            return f"{str(disp).strip()} ({requester_id})"
+        return requester_id
+
+    def _list_entry_line(self, r) -> str:
+        created = _fmt_ts_short(r["created_at"]) if r["created_at"] else "?"
+        checked = _fmt_ts_short(r["last_checked_at"])
+        st = _status_ru(str(r["status"]))
+        if r["status"] == "found" and r["plex_title"]:
+            tail = f"Plex: «{r['plex_title']}»"
+        else:
+            tail = r["last_check_message"] or "—"
+        return (
+            f"- #{r['id']} [{st}] «{r['title']}»\n"
+            f"  созд. {created}, пров. {checked}; {tail}"
+        )
 
     async def _cmd_list(self, evt: MessageEvent) -> None:
         rows = await self.database.fetch(
@@ -383,22 +743,22 @@ class PlexZaprosBot(Plugin):
         if not rows:
             await evt.respond("Запросов пока нет.")
             return
-        lines = ["Запросы фильмов (до 30 последних):"]
+        by_user: dict[str, list] = defaultdict(list)
+        user_order: list[str] = []
         for r in rows:
-            created = (
-                r["created_at"].strftime("%Y-%m-%d %H:%M")
-                if r["created_at"]
-                else "?"
-            )
-            checked = (
-                r["last_checked_at"].strftime("%Y-%m-%d %H:%M")
-                if r["last_checked_at"]
-                else "—"
-            )
-            extra = r["plex_title"] or r["last_check_message"] or ""
-            lines.append(
-                f"#{r['id']} [{r['status']}] «{r['title']}» "
-                f"| {r['requester_id']} | созд.: {created} | пров.: {checked}"
-                + (f" | {extra}" if extra else "")
-            )
-        await evt.respond("\n".join(lines))
+            uid = str(r["requester_id"])
+            if uid not in by_user:
+                user_order.append(uid)
+            by_user[uid].append(r)
+
+        blocks = [
+            f"**Запросы фильмов** ({len(rows)} последних, по пользователям)",
+            "",
+        ]
+        for uid in user_order:
+            blocks.append(f"**{await self._requester_label(uid)}**")
+            for r in by_user[uid]:
+                blocks.append(self._list_entry_line(r))
+            blocks.append("")
+        text = "\n".join(blocks).strip()
+        await evt.respond(text)

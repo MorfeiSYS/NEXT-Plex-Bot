@@ -8,7 +8,8 @@ Maubot-плагин для поиска фильмов на Plex Media Server и
 - Если фильм есть — ответ запросившему (`reply_mode`: `room` или `dm`).
 - Если нет — запись в БД, уведомление операторов из `notify_users`, периодическая проверка Plex.
 - `!zapros list` — список запросов (только пользователи из `notify_users`).
-- Блок `queue_summary` в YAML-config инстанса (обновляется плагином для обзора в менеджере Maubot).
+- В YAML-config инстанса: `queue_summary` и `movie_requests` (последние до 25 записей из БД).
+- Вкладка **Database** в Maubot — прямой просмотр SQLite; служебная таблица `sqlite_sequence` не используется для запросов.
 
 ## Сборка
 
@@ -36,11 +37,16 @@ chmod +x build.sh && ./build.sh
 | `plex.token` | [X-Plex-Token](https://support.plex.tv/articles/204050366-finding-an-authentication-token-x-plex-token/) |
 | `plex.client_identifier` | Идентификатор клиента для Plex API |
 | `notify_users` | MXID операторов (уведомления + `!zapros list`) |
-| `reply_mode` | `room` — ответ в комнате; `dm` — личные сообщения |
-| `poll_interval_hours` | Интервал опроса Plex для pending (по умолчанию 6) |
+| `reply_mode` | `room` — ответ в комнате; `dm` — личные сообщения (в обычной комнате бот только кратко подтверждает отправку в ЛС) |
+| `notify_mode` | Операторское уведомление: `dm`, `room`, `both`, `fixed`. По умолчанию как `reply_mode` |
+| `notify_room` | Админская комната (`!abc:server`). При `room`/`both`/`fixed` — туда, а не в личку пользователя с ботом |
+| `retention_days` | Удалять записи в БД старше N дней (по `created_at`), по умолчанию 90; `0` — отключить |
+| `poll_interval_hours` | Пауза между полными циклами опроса pending (по умолчанию 6) |
+| `poll_startup_seconds` | Задержка перед первым циклом после старта (по умолчанию 15) |
+| `poll_between_pending_seconds` | Пауза между проверками разных pending в одном цикле (по умолчанию 2; 0 — без паузы) |
 | `search_limit` | Лимит результатов hubs/search |
 
-`queue_summary` обновляется автоматически; при ручном сохранении config не удаляйте блок, если он уже есть.
+`queue_summary` и `movie_requests` обновляются автоматически; при ручном сохранении config не удаляйте эти блоки. Не дублируйте в YAML комментарии перед `movie_requests` — при слиянии с `base-config` Maubot может множить строки; лишние комментарии в инстансе можно удалить вручную один раз.
 
 ## Команды
 
@@ -48,6 +54,29 @@ chmod +x build.sh && ./build.sh
 !zapros "Интерстеллар"
 !zapros list
 ```
+
+`!zapros list` (только `notify_users`) — сгруппированный список до 30 последних запросов:
+
+```text
+**Запросы фильмов** (N последних, по пользователям)
+
+**Ирина** (@irina:example.com)
+- #14 [ожидает] «Название»
+  созд. 2026-11-07 16:52, пров. 2026-11-07 17:08; На сервере не найден
+```
+
+Группировка по пользователю; у каждой строки — id, статус (`ожидает` / `найден`), даты и итог проверки Plex.
+
+## Шифрование (E2EE)
+
+Личные комнаты с ботом обычно зашифрованы. Без настройки crypto maubot **не увидит** `!zapros` в DM (в логах клиента — `Failed to decrypt`).
+
+1. Установите maubot с `[encryption]` (или Docker-образ с crypto).
+2. В `config.yaml` maubot задайте `crypto_db` и `crypto_db_pickle_key` (до первого запуска).
+3. Создайте клиента через `mbc auth` — нужны **свой** access token и **device ID**, не токен из Element.
+4. В UI у клиента должен отображаться fingerprint; перезапустите client/instance.
+
+Проверка: в **незашифрованной** комнате с `reply_mode: room` отправьте `!zapros "тест"`. Если там ответ есть, а в зашифрованном DM нет — проблема в E2EE клиента maubot.
 
 ## Проверка
 

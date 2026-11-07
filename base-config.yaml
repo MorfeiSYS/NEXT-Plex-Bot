@@ -5,9 +5,19 @@ plex:
 notify_users:
   - "@operator:example.com"
 reply_mode: room
+# Куда слать уведомления о новых запросах (не найден на Plex):
+# dm — личка notify_users; room — notify_room (если задан), иначе групповая комната
+# запроса (не личка с пользователем); both — комната + личка; fixed — только notify_room
+# Если notify_mode не задан — как reply_mode
+notify_mode: room
+notify_room: ""
+retention_days: 90
 poll_interval_hours: 6
+poll_startup_seconds: 15
+poll_between_pending_seconds: 2
 search_limit: 10
 queue_summary:
   updated_at: null
   pending_count: 0
   items: []
+movie_requests: []
