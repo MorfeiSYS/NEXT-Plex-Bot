@@ -24,7 +24,7 @@ Maubot-плагин для поиска фильмов на Plex Media Server и
 chmod +x build.sh && ./build.sh
 ```
 
-Архив: `NEXT.plex-zapros-v1.0.0.mbp`.
+Архив: `NEXT.plex-zapros-vX.X.X.mbp`.
 
 ## Установка
 
@@ -35,7 +35,7 @@ chmod +x build.sh && ./build.sh
 | Поле | Описание |
 |------|----------|
 | `plex.base_url` | URL PMS, напр. `http://192.168.1.10:32400` |
-| `plex.token` | [X-Plex-Token](https://support.plex.tv/articles/204050366-finding-an-authentication-token-x-plex-token/) |
+| `plex.token` | [X-Plex-Token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) |
 | `plex.client_identifier` | Идентификатор клиента для Plex API |
 | `notify_users` | MXID операторов (уведомления + `!zapros list`) |
 | `reply_mode` | `room` — ответ в комнате; `dm` — личные сообщения (в обычной комнате бот только кратко подтверждает отправку в ЛС) |
