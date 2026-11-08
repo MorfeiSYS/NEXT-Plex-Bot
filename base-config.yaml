@@ -15,6 +15,8 @@ retention_days: 90
 poll_interval_hours: 6
 poll_startup_seconds: 15
 poll_between_pending_seconds: 2
+# Пауза между исходящими сообщениями Matrix (сек.), снижает 429 на list/модерации
+matrix_send_pause_seconds: 0.55
 search_limit: 10
 # Макс. позиций в списке при нескольких похожих результатах !zapros
 search_results_max: 5

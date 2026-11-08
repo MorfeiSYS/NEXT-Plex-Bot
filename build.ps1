@@ -20,7 +20,11 @@ if (-not $id -or -not $version) {
 }
 
 $outName = "${id}-v${version}.mbp"
-$outFile = Join-Path $PSScriptRoot $outName
+$outDir = Join-Path $PSScriptRoot "bild"
+if (-not (Test-Path -LiteralPath $outDir)) {
+    New-Item -ItemType Directory -Path $outDir | Out-Null
+}
+$outFile = Join-Path $outDir $outName
 
 if (Get-Command mbc -ErrorAction SilentlyContinue) {
     Write-Host "Using mbc build -> $outName"
@@ -44,7 +48,7 @@ foreach ($f in $files) {
     }
 }
 
-$zipTemp = Join-Path $PSScriptRoot "$outName.zip"
+$zipTemp = Join-Path $outDir "$outName.zip"
 foreach ($p in @($outFile, $zipTemp)) {
     if (Test-Path -LiteralPath $p) {
         Remove-Item -LiteralPath $p -Force

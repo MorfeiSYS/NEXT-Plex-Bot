@@ -1,6 +1,6 @@
 maubot: 0.3.0
 id: NEXT.plex-zapros
-version: 1.0.29
+version: 1.0.34
 license: MIT
 modules:
   - plex

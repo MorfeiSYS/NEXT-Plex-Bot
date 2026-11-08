@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -9,12 +10,15 @@ from typing import AsyncIterator, Optional, Type
 
 import aiohttp
 from maubot import Plugin, MessageEvent
-from maubot.handlers import command
+from maubot.handlers import command, event
 from maubot.matrix import parse_formatted
+from mautrix.errors.request import MLimitExceeded
 from mautrix.types import (
+    EventID,
     EventType,
     Format,
     MessageType,
+    ReactionEvent,
     RoomCreatePreset,
     TextMessageEventContent,
 )
@@ -39,6 +43,56 @@ _ZAPROS_DUP_RE = re.compile(r"!zapros\b", re.IGNORECASE)
 _PLEX_SESSION_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45)
 _DB_DISPLAY_UNSAFE_RE = re.compile(r"<[^>]*>")
 _DB_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_PLUGIN_ID = "NEXT.plex-zapros"
+_maubot_db_ui_revert_done = False
+_MOD_ACCEPT_KEYS = frozenset({"✅", "✅️", "☑️", "👍", "👍️", "white_check_mark"})
+_MOD_REJECT_KEYS = frozenset({"⛔", "⛔️", "🚫", "no_entry", "👎", "👎️"})
+_MOD_CMD_RE = re.compile(
+    r"^(accept|approve|reject|deny)\s+(\d+)\s*$", re.IGNORECASE
+)
+
+
+def _restore_maubot_database_ui() -> None:
+    """Сброс патча UI Database из v1.0.30 (остаётся в процессе maubot до перезапуска)."""
+    global _maubot_db_ui_revert_done
+    if _maubot_db_ui_revert_done:
+        return
+    try:
+        from maubot.instance import PluginInstance
+        import maubot.management.api.instance_database as idb
+        from maubot.lib.optionalalchemy import Engine
+    except ImportError:
+        return
+    _maubot_db_ui_revert_done = True
+
+    async def get_db_tables(self):  # type: ignore[no-untyped-def]
+        if self.inst_db_tables is None:
+            if isinstance(self.inst_db, Engine):
+                self.inst_db_tables = self._introspect_sqlalchemy()
+            elif self.inst_db.scheme == Scheme.SQLITE:
+                self.inst_db_tables = await self._introspect_sqlite()
+            else:
+                self.inst_db_tables = await self._introspect_postgres()
+        return self.inst_db_tables
+
+    PluginInstance.get_db_tables = get_db_tables  # type: ignore[method-assign]
+
+    q = idb.query
+    closure = getattr(q, "__closure__", None)
+    if closure:
+        for cell in closure:
+            fn = cell.cell_contents
+            if (
+                fn is not q
+                and inspect.iscoroutinefunction(fn)
+                and getattr(fn, "__module__", "").endswith("instance_database")
+            ):
+                idb.query = fn  # type: ignore[method-assign]
+                break
+
+    for inst in PluginInstance.cache.values():
+        if inst.type == _PLUGIN_ID:
+            inst.inst_db_tables = None
 
 
 def _utc_now() -> datetime:
@@ -62,7 +116,29 @@ def _status_ru(status: str) -> str:
         return "найден"
     if status == "pending":
         return "ожидает"
+    if status == "awaiting_approval":
+        return "на модерации"
     return status
+
+
+def _normalize_reaction_key(key: str) -> str:
+    return re.sub(r"[\ufe0e\ufe0f\u200d]", "", (key or "").strip().lower())
+
+
+def _moderation_action_from_reaction(key: str) -> Optional[str]:
+    raw = _normalize_reaction_key(key)
+    if not raw:
+        return None
+    if raw in _MOD_ACCEPT_KEYS or raw.startswith("✅") or raw.startswith("☑"):
+        return "accept"
+    if raw in _MOD_REJECT_KEYS or raw.startswith("⛔") or raw.startswith("🚫"):
+        return "reject"
+    low = raw.lower()
+    if "white_check_mark" in low:
+        return "accept"
+    if "no_entry" in low:
+        return "reject"
+    return None
 
 
 def _parse_utc_ts(value) -> Optional[datetime]:
@@ -233,6 +309,50 @@ async def upgrade_v5(conn, scheme: Scheme) -> None:
         )
 
 
+@upgrade_table.register(description="Moderation notify map and queue index")
+async def upgrade_v6(conn, scheme: Scheme) -> None:
+    if scheme == Scheme.SQLITE:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS moderation_notify_map (
+                event_id TEXT PRIMARY KEY,
+                request_id INTEGER NOT NULL,
+                room_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await conn.execute("DROP INDEX IF EXISTS movie_requests_pending_uq")
+        await conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS movie_requests_pending_uq
+            ON movie_requests (title_norm, requester_id)
+            WHERE status IN ('pending', 'awaiting_approval')
+            """
+        )
+    else:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS moderation_notify_map (
+                event_id TEXT PRIMARY KEY,
+                request_id INTEGER NOT NULL,
+                room_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        await conn.execute("DROP INDEX IF EXISTS movie_requests_pending_uq")
+        await conn.execute(
+            """
+            CREATE UNIQUE INDEX movie_requests_pending_uq
+            ON movie_requests (title_norm, requester_id)
+            WHERE status IN ('pending', 'awaiting_approval')
+            """
+        )
+
+
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         helper.copy("plex")
@@ -252,6 +372,7 @@ class Config(BaseProxyConfig):
         helper.copy("list_users_max")
         helper.copy("daily_requests_per_user_max")
         helper.copy("daily_found_requests_per_user_max")
+        helper.copy("matrix_send_pause_seconds")
         for key in ("queue_summary", "movie_requests"):
             if key in self:
                 helper.base[key] = self[key]
@@ -272,6 +393,8 @@ class PlexZaprosBot(Plugin):
         self._interactive_plex_lock = asyncio.Lock()
         self._dm_rooms: dict[str, str] = {}
         self._room_labels: dict[str, str] = {}
+        self._matrix_send_lock = asyncio.Lock()
+        self._last_matrix_send: float = 0.0
 
     @classmethod
     def get_db_upgrade_table(cls) -> UpgradeTable:
@@ -280,6 +403,9 @@ class PlexZaprosBot(Plugin):
     @classmethod
     def get_config_class(cls) -> Type[BaseProxyConfig]:
         return Config
+
+    async def pre_start(self) -> None:
+        _restore_maubot_database_ui()
 
     async def start(self) -> None:
         self.config.load_and_update()
@@ -369,6 +495,256 @@ class PlexZaprosBot(Plugin):
     def _is_operator(self, evt: MessageEvent) -> bool:
         return str(evt.sender) in self._notify_users()
 
+    def _is_operator_mxid(self, mxid: str) -> bool:
+        return str(mxid) in self._notify_users()
+
+    def _matrix_send_pause_seconds(self) -> float:
+        try:
+            return max(0.1, float(self._conf("matrix_send_pause_seconds", 0.55)))
+        except (TypeError, ValueError):
+            return 0.55
+
+    async def _client_send_text_ratelimited(self, room_id: str, text: str):
+        pause = self._matrix_send_pause_seconds()
+        last_err: Optional[Exception] = None
+        async with self._matrix_send_lock:
+            for attempt in range(8):
+                gap = pause - (self.loop.time() - self._last_matrix_send)
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                try:
+                    event_id = await self.client.send_text(str(room_id), text)
+                    self._last_matrix_send = self.loop.time()
+                    return event_id
+                except MLimitExceeded as e:
+                    last_err = e
+                    await asyncio.sleep(min(4.0, max(1.0, pause) * (attempt + 1)))
+            if last_err:
+                raise last_err
+            raise RuntimeError("send_text failed")
+
+    async def _respond_ratelimited(self, evt: MessageEvent, text: str) -> None:
+        pause = self._matrix_send_pause_seconds()
+        last_err: Optional[Exception] = None
+        async with self._matrix_send_lock:
+            for attempt in range(8):
+                gap = pause - (self.loop.time() - self._last_matrix_send)
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                try:
+                    await evt.respond(text)
+                    self._last_matrix_send = self.loop.time()
+                    return
+                except MLimitExceeded as e:
+                    last_err = e
+                    await asyncio.sleep(min(4.0, max(1.0, pause) * (attempt + 1)))
+            if last_err:
+                raise last_err
+
+    async def _client_react_ratelimited(
+        self, room_id: str, event_id: str, key: str
+    ) -> None:
+        pause = self._matrix_send_pause_seconds()
+        last_err: Optional[Exception] = None
+        async with self._matrix_send_lock:
+            for attempt in range(8):
+                gap = pause - (self.loop.time() - self._last_matrix_send)
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                try:
+                    await self.client.react(str(room_id), EventID(event_id), key)
+                    self._last_matrix_send = self.loop.time()
+                    return
+                except MLimitExceeded as e:
+                    last_err = e
+                    await asyncio.sleep(min(4.0, max(1.0, pause) * (attempt + 1)))
+            if last_err:
+                raise last_err
+
+    async def _request_row(self, request_id: int) -> Optional[dict]:
+        return await self.database.fetchrow(
+            "SELECT * FROM movie_requests WHERE id=$1", request_id
+        )
+
+    async def _register_moderation_notify(
+        self,
+        event_id: str,
+        request_id: int,
+        room_id: str,
+        kind: str,
+    ) -> None:
+        await self.database.execute(
+            "DELETE FROM moderation_notify_map WHERE event_id=$1", event_id
+        )
+        await self.database.execute(
+            """
+            INSERT INTO moderation_notify_map
+            (event_id, request_id, room_id, kind, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            event_id,
+            request_id,
+            room_id,
+            kind,
+            _db_now(),
+        )
+
+    async def _lookup_moderation_notify(self, event_id: str) -> Optional[dict]:
+        return await self.database.fetchrow(
+            "SELECT * FROM moderation_notify_map WHERE event_id=$1", event_id
+        )
+
+    async def _send_moderation_card(
+        self, room_id: str, body: str, request_id: int, kind: str
+    ) -> Optional[str]:
+        rid = str(room_id)
+        text = body.rstrip()
+        try:
+            event_id = await self._client_send_text_ratelimited(rid, text)
+        except Exception as e:
+            self.log.error(f"Не удалось отправить карточку модерации в {rid}: {e}")
+            return None
+        eid = str(event_id)
+        await self._register_moderation_notify(eid, request_id, rid, kind)
+        for emoji in ("✅", "⛔"):
+            try:
+                await self._client_react_ratelimited(rid, eid, emoji)
+            except Exception as e:
+                self.log.warning(
+                    f"Не удалось поставить реакцию {emoji!r} на {eid}: {e}"
+                )
+        return eid
+
+    async def _moderation_reply(
+        self,
+        text: str,
+        reply_evt: Optional[MessageEvent] = None,
+        room_id: Optional[str] = None,
+    ) -> None:
+        if reply_evt is not None:
+            await self._respond_ratelimited(reply_evt, text)
+            return
+        if room_id:
+            await self._client_send_text_ratelimited(str(room_id), text)
+
+    async def _moderation_accept(
+        self,
+        request_id: int,
+        operator: str,
+        reply_evt: Optional[MessageEvent] = None,
+        room_id: Optional[str] = None,
+    ) -> None:
+        if not self._is_operator_mxid(operator):
+            await self._moderation_reply(
+                "Модерация доступна только операторам.", reply_evt, room_id
+            )
+            return
+        row = await self._request_row(request_id)
+        if not row:
+            await self._moderation_reply(
+                f"Запрос #{request_id} не найден (уже обработан).",
+                reply_evt,
+                room_id,
+            )
+            return
+        status = str(row["status"])
+        title = str(row["title"])
+        requester = str(row["requester_id"])
+        req_room = str(row["room_id"])
+        if status == "awaiting_approval":
+            now = _db_now()
+            await self.database.execute(
+                """
+                UPDATE movie_requests
+                SET status='pending', last_checked_at=$1
+                WHERE id=$2 AND status='awaiting_approval'
+                """,
+                now,
+                request_id,
+            )
+            await self._deliver(
+                requester,
+                req_room,
+                f"✅ Ваш запрос #{request_id} «{title}» одобрён; "
+                f"повторная проверка Plex каждые "
+                f"{self._conf('poll_interval_hours', 6)} ч.",
+            )
+            await self.refresh_queue_summary()
+            await self._moderation_reply(
+                f"Запрос #{request_id} «{title}» принят оператором {operator}.",
+                reply_evt,
+                room_id,
+            )
+            return
+        if status == "pending":
+            await self._deliver(
+                requester,
+                req_room,
+                f"✅ Запрос #{request_id} «{title}» в очереди на добавление.",
+            )
+            await self._moderation_reply(
+                f"Запрос #{request_id} уже в очереди (подтверждение отправлено).",
+                reply_evt,
+                room_id,
+            )
+            return
+        await self._moderation_reply(
+            f"Запрос #{request_id} в статусе «{_status_ru(status)}», "
+            "принятие недоступно.",
+            reply_evt,
+            room_id,
+        )
+
+    async def _moderation_reject(
+        self,
+        request_id: int,
+        operator: str,
+        reply_evt: Optional[MessageEvent] = None,
+        room_id: Optional[str] = None,
+    ) -> None:
+        if not self._is_operator_mxid(operator):
+            await self._moderation_reply(
+                "Модерация доступна только операторам.", reply_evt, room_id
+            )
+            return
+        row = await self._request_row(request_id)
+        if not row:
+            await self._moderation_reply(
+                f"Запрос #{request_id} не найден (уже обработан).",
+                reply_evt,
+                room_id,
+            )
+            return
+        status = str(row["status"])
+        if status not in ("awaiting_approval", "pending"):
+            await self._moderation_reply(
+                f"Запрос #{request_id} нельзя отклонить "
+                f"(статус «{_status_ru(status)}»).",
+                reply_evt,
+                room_id,
+            )
+            return
+        title = str(row["title"])
+        requester = str(row["requester_id"])
+        req_room = str(row["room_id"])
+        await self.database.execute(
+            "DELETE FROM moderation_notify_map WHERE request_id=$1", request_id
+        )
+        await self.database.execute(
+            "DELETE FROM movie_requests WHERE id=$1", request_id
+        )
+        await self._deliver(
+            requester,
+            req_room,
+            f"⛔️ Ваш запрос #{request_id} «{title}» отклонён оператором.",
+        )
+        await self.refresh_queue_summary()
+        await self._moderation_reply(
+            f"Запрос #{request_id} «{title}» отклонён оператором {operator}.",
+            reply_evt,
+            room_id,
+        )
+
     def _parse_movie_title(self, body: str) -> Optional[str]:
         body = body.strip()
         m = _TITLE_QUOTED_YEAR_SUFFIX_RE.match(body)
@@ -430,7 +806,8 @@ class PlexZaprosBot(Plugin):
         row = await self.database.fetchrow(
             """
             SELECT 1 FROM movie_requests
-            WHERE title_norm=$1 AND requester_id=$2 AND status='pending'
+            WHERE title_norm=$1 AND requester_id=$2
+              AND status IN ('pending', 'awaiting_approval')
             """,
             normalize_title(title),
             requester,
@@ -794,11 +1171,21 @@ class PlexZaprosBot(Plugin):
             return None
         return str(request_room_id)
 
-    async def _notify_operators_dm(self, msg: str) -> None:
+    async def _notify_operators_dm_card(
+        self, body: str, request_id: int, kind: str
+    ) -> None:
         for op in self._notify_users():
             try:
-                await self._send_dm(op, msg)
-                self.log.info(f"Уведомление оператору {op} (DM)")
+                dm = await self._dm_room_for(op)
+                if not dm:
+                    dm = await self.client.create_room(
+                        preset=RoomCreatePreset.PRIVATE,
+                        invitees=[op],
+                        is_direct=True,
+                    )
+                    self._dm_rooms[op] = str(dm)
+                await self._send_moderation_card(str(dm), body, request_id, kind)
+                self.log.info(f"Карточка модерации #{request_id} оператору {op} (DM)")
             except Exception as e:
                 self.log.error(f"Не удалось уведомить оператора {op}: {e}")
 
@@ -814,7 +1201,8 @@ class PlexZaprosBot(Plugin):
         room_label = await self._room_human_label(room_id)
         msg = (
             f"Новый запрос контента #{request_id}: «{title}»\n"
-            f"От: {requester}\nКомната: {room_label}"
+            f"От: {requester}\nКомната: {room_label}\n"
+            f"Принять ✅ | Отклонить ⛔"
         )
         mode = self._notify_mode()
 
@@ -832,31 +1220,23 @@ class PlexZaprosBot(Plugin):
                     "notify_mode=fixed, но notify_room не задан — уведомление пропущено"
                 )
                 return
-            try:
-                await self.client.send_text(target, msg)
-                self.log.info(f"Уведомление операторам в комнату {target}")
-            except Exception as e:
-                self.log.error(f"Не удалось уведомить в {target}: {e}")
+            await self._send_moderation_card(target, msg, request_id, "new")
+            self.log.info(f"Карточка модерации #{request_id} в комнату {target}")
             return
 
         if mode in ("dm", "both"):
-            await self._notify_operators_dm(msg)
+            await self._notify_operators_dm_card(msg, request_id, "new")
 
         if mode in ("room", "both"):
             target = await self._operator_notify_room(room_id, requester)
             if target:
-                try:
-                    await self.client.send_text(target, msg)
-                    self.log.info(f"Уведомление операторам в комнату {target}")
-                except Exception as e:
-                    self.log.error(
-                        f"Не удалось уведомить операторов в {target}: {e}"
-                    )
+                await self._send_moderation_card(target, msg, request_id, "new")
+                self.log.info(f"Карточка модерации #{request_id} в комнату {target}")
             elif mode == "room":
                 self.log.info(
                     "Запрос из лички, notify_room не задан — дублируем в DM операторам"
                 )
-                await self._notify_operators_dm(msg)
+                await self._notify_operators_dm_card(msg, request_id, "new")
 
     async def _insert_pending(
         self, title: str, requester: str, room_id: str, check_message: str
@@ -868,7 +1248,8 @@ class PlexZaprosBot(Plugin):
         row = await self.database.fetchrow(
             """
             SELECT id FROM movie_requests
-            WHERE title_norm=$1 AND requester_id=$2 AND status='pending'
+            WHERE title_norm=$1 AND requester_id=$2
+              AND status IN ('pending', 'awaiting_approval')
             """,
             title_norm,
             requester,
@@ -894,7 +1275,7 @@ class PlexZaprosBot(Plugin):
                 title, title_norm, requester_id, room_id, status,
                 created_at, last_checked_at, last_check_message,
                 times_requested
-            ) VALUES ($1,$2,$3,$4,'pending',$5,$5,$6,1)
+            ) VALUES ($1,$2,$3,$4,'awaiting_approval',$5,$5,$6,1)
             RETURNING id
             """,
             safe_title,
@@ -917,6 +1298,7 @@ class PlexZaprosBot(Plugin):
             SELECT id, title, requester_id, status, created_at, last_checked_at,
                    last_check_message, plex_title
             FROM movie_requests
+            WHERE status IN ('pending', 'found')
             ORDER BY created_at DESC
             LIMIT 25
             """
@@ -1073,11 +1455,17 @@ class PlexZaprosBot(Plugin):
         )
         try:
             await self._zapros_cmd(evt, body)
+        except MLimitExceeded:
+            self.log.warning("!zapros: лимит запросов homeserver (429), ответ не отправлен")
         except Exception as e:
             self.log.exception(f"Ошибка при обработке !zapros: {e}")
-            await evt.respond(
-                "Внутренняя ошибка при обработке запроса. Проверьте логи инстанса."
-            )
+            try:
+                await self._respond_ratelimited(
+                    evt,
+                    "Внутренняя ошибка при обработке запроса. Проверьте логи инстанса.",
+                )
+            except MLimitExceeded:
+                self.log.warning("Не удалось отправить ответ об ошибке: 429")
 
     async def _zapros_cmd(self, evt: MessageEvent, body: Optional[str]) -> None:
         raw = (body or "").strip()
@@ -1097,6 +1485,20 @@ class PlexZaprosBot(Plugin):
                 await evt.respond("Команда list доступна только операторам.")
                 return
             await self._cmd_list(evt)
+            return
+        mod_cmd = _MOD_CMD_RE.match(raw)
+        if mod_cmd:
+            if not self._is_operator(evt):
+                await evt.respond(
+                    "Команды accept/reject доступны только операторам."
+                )
+                return
+            verb = mod_cmd.group(1).lower()
+            req_id = int(mod_cmd.group(2))
+            if verb in ("accept", "approve"):
+                await self._moderation_accept(req_id, str(evt.sender), evt)
+            else:
+                await self._moderation_reject(req_id, str(evt.sender), evt)
             return
         title = self._parse_movie_title(raw)
         if not title:
@@ -1167,9 +1569,8 @@ class PlexZaprosBot(Plugin):
         await self._deliver(
             str(evt.sender),
             str(evt.room_id),
-            f"⛔️ Фильм «{title}» на Plex не найден. Запрос сохранён"
-            f"{f' (#{req_id})' if req_id else ''}; повторная проверка каждые "
-            f"{self._conf('poll_interval_hours', 6)} ч.",
+            f"⛔️ Фильм «{title}» на Plex не найден. Запрос отправлен на модерацию"
+            f"{f' (#{req_id})' if req_id else ''}.",
             in_room=evt,
         )
         await self.refresh_queue_summary()
@@ -1193,8 +1594,8 @@ class PlexZaprosBot(Plugin):
         else:
             tail = r["last_check_message"] or "—"
         return (
-            f"- #{r['id']} [{st}] «{r['title']}»\n"
-            f"  созд. {created}, пров. {checked}; {tail}"
+            f"#{r['id']} [{st}] «{r['title']}» "
+            f"созд. {created}, пров. {checked}; {tail} ✅ | ⛔"
         )
 
     async def _cmd_list(self, evt: MessageEvent) -> None:
@@ -1233,15 +1634,51 @@ class PlexZaprosBot(Plugin):
             await evt.respond("Запросов пока нет.")
             return
 
-        blocks = [
-            "**Запросы фильмов** (только ожидающие)",
-            f"(до {per_user} на пользователя, до {users_max} пользователей)",
-            "",
-        ]
+        header = (
+            f"**Запросы фильмов** (только ожидающие)\n"
+            f"(до {per_user} на пользователя, до {users_max} пользователей)"
+        )
+        try:
+            await self._respond_ratelimited(evt, header)
+        except MLimitExceeded:
+            self.log.warning("!zapros list: 429 на заголовке")
+            return
+        list_room = str(evt.room_id)
         for uid in user_order:
-            blocks.append(f"**{await self._requester_label(uid)}**")
+            try:
+                await self._respond_ratelimited(
+                    evt, f"**{await self._requester_label(uid)}**"
+                )
+            except MLimitExceeded:
+                self.log.warning("!zapros list: 429, список оборван")
+                return
             for r in by_user[uid]:
-                blocks.append(self._list_entry_line(r))
-            blocks.append("")
-        text = "\n".join(blocks).strip()
-        await evt.respond(text)
+                line = self._list_entry_line(r)
+                card = await self._send_moderation_card(
+                    list_room, line, int(r["id"]), "list"
+                )
+                if card is None:
+                    return
+
+    @event.on(EventType.REACTION)
+    async def on_moderation_reaction(self, evt: ReactionEvent) -> None:
+        if str(evt.sender) == str(self.client.mxid):
+            return
+        if not self._is_operator_mxid(str(evt.sender)):
+            return
+        rel = evt.content.relates_to
+        if not rel or not rel.event_id:
+            return
+        action = _moderation_action_from_reaction(rel.key or "")
+        if not action:
+            return
+        row = await self._lookup_moderation_notify(str(rel.event_id))
+        if not row:
+            return
+        req_id = int(row["request_id"])
+        room_id = str(evt.room_id)
+        operator = str(evt.sender)
+        if action == "accept":
+            await self._moderation_accept(req_id, operator, room_id=room_id)
+        else:
+            await self._moderation_reject(req_id, operator, room_id=room_id)
