@@ -25,6 +25,10 @@ title_max_length: 100
 # !zapros list: макс. запросов на одного пользователя и макс. числа пользователей в ответе
 list_per_user_max: 5
 list_users_max: 10
+# Суточный лимит новых запросов «не найден на Plex» (pending) на пользователя; 0 — без лимита; повтор того же pending не считается; операторы notify_users без лимита
+daily_requests_per_user_max: 0
+# Суточный лимит запросов с результатом «найден на Plex» на пользователя (0 — без лимита, иначе 1–1000); операторы notify_users без лимита
+daily_found_requests_per_user_max: 1000
 queue_summary:
   updated_at: null
   pending_count: 0

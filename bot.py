@@ -179,6 +179,60 @@ async def upgrade_v2(conn, scheme: Scheme) -> None:
     )
 
 
+@upgrade_table.register(description="Daily !zapros usage counters")
+async def upgrade_v3(conn, scheme: Scheme) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS zapros_daily_usage (
+            requester_id TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (requester_id, usage_date)
+        )
+        """
+    )
+
+
+@upgrade_table.register(description="Daily found-on-Plex usage counter column")
+async def upgrade_v4(conn, scheme: Scheme) -> None:
+    if scheme == Scheme.SQLITE:
+        rows = await conn.fetch("PRAGMA table_info(zapros_daily_usage)")
+        if not any(str(r["name"]) == "found_request_count" for r in rows):
+            await conn.execute(
+                """
+                ALTER TABLE zapros_daily_usage
+                ADD COLUMN found_request_count INTEGER NOT NULL DEFAULT 0
+                """
+            )
+    else:
+        await conn.execute(
+            """
+            ALTER TABLE zapros_daily_usage
+            ADD COLUMN IF NOT EXISTS found_request_count INTEGER NOT NULL DEFAULT 0
+            """
+        )
+
+
+@upgrade_table.register(description="times_requested counter on movie_requests")
+async def upgrade_v5(conn, scheme: Scheme) -> None:
+    if scheme == Scheme.SQLITE:
+        rows = await conn.fetch("PRAGMA table_info(movie_requests)")
+        if not any(str(r["name"]) == "times_requested" for r in rows):
+            await conn.execute(
+                """
+                ALTER TABLE movie_requests
+                ADD COLUMN times_requested INTEGER NOT NULL DEFAULT 1
+                """
+            )
+    else:
+        await conn.execute(
+            """
+            ALTER TABLE movie_requests
+            ADD COLUMN IF NOT EXISTS times_requested INTEGER NOT NULL DEFAULT 1
+            """
+        )
+
+
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         helper.copy("plex")
@@ -196,6 +250,8 @@ class Config(BaseProxyConfig):
         helper.copy("title_max_length")
         helper.copy("list_per_user_max")
         helper.copy("list_users_max")
+        helper.copy("daily_requests_per_user_max")
+        helper.copy("daily_found_requests_per_user_max")
         for key in ("queue_summary", "movie_requests"):
             if key in self:
                 helper.base[key] = self[key]
@@ -352,6 +408,129 @@ class PlexZaprosBot(Plugin):
             n = 10
         return max(1, min(50, n))
 
+    def _daily_requests_per_user_max(self) -> int:
+        try:
+            n = int(self._conf("daily_requests_per_user_max", 0))
+        except (TypeError, ValueError):
+            n = 0
+        return max(0, min(100, n))
+
+    def _daily_found_requests_per_user_max(self) -> int:
+        try:
+            n = int(self._conf("daily_found_requests_per_user_max", 1000))
+        except (TypeError, ValueError):
+            n = 1000
+        return max(0, min(1000, n))
+
+    def _local_usage_date(self) -> str:
+        local = _utc_now() + timedelta(hours=self._timezone_offset_hours())
+        return local.strftime("%Y-%m-%d")
+
+    async def _has_pending_duplicate(self, title: str, requester: str) -> bool:
+        row = await self.database.fetchrow(
+            """
+            SELECT 1 FROM movie_requests
+            WHERE title_norm=$1 AND requester_id=$2 AND status='pending'
+            """,
+            normalize_title(title),
+            requester,
+        )
+        return row is not None
+
+    async def _try_consume_pending_daily_quota(
+        self, requester_id: str
+    ) -> Optional[str]:
+        limit = self._daily_requests_per_user_max()
+        if limit <= 0:
+            return None
+        return await self._increment_daily_usage(
+            requester_id,
+            pending=True,
+            limit=limit,
+            over_msg=(
+                f"Превышен суточный лимит запросов на добавление ({limit} в сутки). "
+                "Попробуйте завтра."
+            ),
+        )
+
+    async def _try_consume_found_daily_quota(
+        self, requester_id: str
+    ) -> Optional[str]:
+        limit = self._daily_found_requests_per_user_max()
+        if limit <= 0:
+            return None
+        return await self._increment_daily_usage(
+            requester_id,
+            pending=False,
+            limit=limit,
+            over_msg=(
+                f"Превышен суточный лимит запросов с найденным на Plex "
+                f"({limit} в сутки). Попробуйте завтра."
+            ),
+        )
+
+    async def _increment_daily_usage(
+        self,
+        requester_id: str,
+        *,
+        pending: bool,
+        limit: int,
+        over_msg: str,
+    ) -> Optional[str]:
+        usage_date = self._local_usage_date()
+        row = await self.database.fetchrow(
+            """
+            SELECT request_count, found_request_count FROM zapros_daily_usage
+            WHERE requester_id=$1 AND usage_date=$2
+            """,
+            requester_id,
+            usage_date,
+        )
+        if row:
+            pending_n = int(row["request_count"])
+            found_n = int(row["found_request_count"])
+        else:
+            pending_n = found_n = 0
+        current = pending_n if pending else found_n
+        if current >= limit:
+            return over_msg
+        if row:
+            if pending:
+                await self.database.execute(
+                    """
+                    UPDATE zapros_daily_usage
+                    SET request_count = request_count + 1
+                    WHERE requester_id=$1 AND usage_date=$2
+                    """,
+                    requester_id,
+                    usage_date,
+                )
+            else:
+                await self.database.execute(
+                    """
+                    UPDATE zapros_daily_usage
+                    SET found_request_count = found_request_count + 1
+                    WHERE requester_id=$1 AND usage_date=$2
+                    """,
+                    requester_id,
+                    usage_date,
+                )
+        else:
+            pending_init = 1 if pending else 0
+            found_init = 0 if pending else 1
+            await self.database.execute(
+                """
+                INSERT INTO zapros_daily_usage
+                (requester_id, usage_date, request_count, found_request_count)
+                VALUES ($1, $2, $3, $4)
+                """,
+                requester_id,
+                usage_date,
+                pending_init,
+                found_init,
+            )
+        return None
+
     def _format_movies_table(self, movies: list[PlexMovie], requested: str) -> str:
         lines = [f"Найдено несколько похожих фильмов для «{requested}»:", ""]
         for i, m in enumerate(movies, 1):
@@ -387,20 +566,55 @@ class PlexZaprosBot(Plugin):
         movie: PlexMovie,
         check_message: str,
     ) -> None:
-        now = _db_now()
+        """Повтор title+пользователь — обновление строки и times_requested, без нового id."""
+        title_norm = normalize_title(title)
         safe_title = _sanitize_db_display(title) or title
         safe_plex_title = _sanitize_db_display(movie.title) or movie.title
         safe_msg = _sanitize_db_display(check_message) or check_message
+        now = _db_now()
+        row = await self.database.fetchrow(
+            """
+            SELECT id FROM movie_requests
+            WHERE title_norm=$1 AND requester_id=$2
+              AND status IN ('pending', 'found')
+            ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, id
+            LIMIT 1
+            """,
+            title_norm,
+            requester,
+        )
+        if row:
+            await self.database.execute(
+                """
+                UPDATE movie_requests
+                SET status='found', found_at=$1, last_checked_at=$1,
+                    room_id=$2, title=$3,
+                    plex_rating_key=$4, plex_title=$5, plex_year=$6,
+                    last_check_message=$7,
+                    times_requested = times_requested + 1
+                WHERE id=$8
+                """,
+                now,
+                room_id,
+                safe_title,
+                movie.rating_key,
+                safe_plex_title,
+                movie.year,
+                safe_msg,
+                row["id"],
+            )
+            return
         await self.database.execute(
             """
             INSERT INTO movie_requests (
                 title, title_norm, requester_id, room_id, status,
                 created_at, found_at, last_checked_at,
-                plex_rating_key, plex_title, plex_year, last_check_message
-            ) VALUES ($1,$2,$3,$4,'found',$5,$5,$5,$6,$7,$8,$9)
+                plex_rating_key, plex_title, plex_year, last_check_message,
+                times_requested
+            ) VALUES ($1,$2,$3,$4,'found',$5,$5,$5,$6,$7,$8,$9,1)
             """,
             safe_title,
-            normalize_title(title),
+            title_norm,
             requester,
             room_id,
             now,
@@ -664,7 +878,8 @@ class PlexZaprosBot(Plugin):
             await self.database.execute(
                 """
                 UPDATE movie_requests
-                SET last_checked_at=$1, last_check_message=$2
+                SET last_checked_at=$1, last_check_message=$2,
+                    times_requested = times_requested + 1
                 WHERE id=$3
                 """,
                 now,
@@ -677,8 +892,9 @@ class PlexZaprosBot(Plugin):
             """
             INSERT INTO movie_requests (
                 title, title_norm, requester_id, room_id, status,
-                created_at, last_checked_at, last_check_message
-            ) VALUES ($1,$2,$3,$4,'pending',$5,$5,$6)
+                created_at, last_checked_at, last_check_message,
+                times_requested
+            ) VALUES ($1,$2,$3,$4,'pending',$5,$5,$6,1)
             RETURNING id
             """,
             safe_title,
@@ -728,7 +944,7 @@ class PlexZaprosBot(Plugin):
         }
         self.config["queue_summary"] = snapshot
         self.config["movie_requests"] = items
-        await asyncio.to_thread(self.config.save)
+        self.config.save()
 
     async def _purge_old_requests(self) -> None:
         days = int(self._conf("retention_days", 90))
@@ -751,6 +967,23 @@ class PlexZaprosBot(Plugin):
                 )
         except Exception as e:
             self.log.error(f"Ошибка очистки БД (retention): {e}")
+        cutoff_local = (
+            _utc_now()
+            + timedelta(hours=self._timezone_offset_hours())
+            - timedelta(days=days)
+        )
+        cutoff_date = cutoff_local.strftime("%Y-%m-%d")
+        try:
+            result = await self.database.execute(
+                "DELETE FROM zapros_daily_usage WHERE usage_date < $1",
+                cutoff_date,
+            )
+            if result:
+                self.log.info(
+                    f"Очистка счётчиков суточных запросов старше {days} дн. ({result})"
+                )
+        except Exception as e:
+            self.log.error(f"Ошибка очистки zapros_daily_usage: {e}")
 
     async def _process_pending_row(self, row) -> None:
         title = row["title"]
@@ -877,6 +1110,7 @@ class PlexZaprosBot(Plugin):
             )
             return
         title = title.strip()
+        requester = str(evt.sender)
         try:
             async with self._interactive_plex_guard():
                 movies, ambiguous = await self._search_plex_interactive(title)
@@ -894,9 +1128,14 @@ class PlexZaprosBot(Plugin):
             return
         movie = movies[0] if movies else None
         if movie:
+            if not self._is_operator(evt):
+                quota_err = await self._try_consume_found_daily_quota(requester)
+                if quota_err:
+                    await evt.respond(quota_err)
+                    return
             await self._record_found(
                 title,
-                str(evt.sender),
+                requester,
                 str(evt.room_id),
                 movie,
                 "Найден при запросе",
@@ -909,9 +1148,15 @@ class PlexZaprosBot(Plugin):
             )
             await self.refresh_queue_summary()
             return
+        if not self._is_operator(evt):
+            if not await self._has_pending_duplicate(title, requester):
+                quota_err = await self._try_consume_pending_daily_quota(requester)
+                if quota_err:
+                    await evt.respond(quota_err)
+                    return
         req_id, is_new = await self._insert_pending(
             title,
-            str(evt.sender),
+            requester,
             str(evt.room_id),
             "Не найден при первичной проверке",
         )
