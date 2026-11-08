@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Type
+from typing import AsyncIterator, Optional, Type
 
+import aiohttp
 from maubot import Plugin, MessageEvent
 from maubot.handlers import command
 from maubot.matrix import parse_formatted
@@ -34,6 +36,7 @@ _TITLE_QUOTED_YEAR_SUFFIX_RE = re.compile(
     r'^["\']([^"\']+)["\'](\s*\(\d{4}\)|\s+\d{4})\s*$'
 )
 _ZAPROS_DUP_RE = re.compile(r"!zapros\b", re.IGNORECASE)
+_PLEX_SESSION_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45)
 _DB_DISPLAY_UNSAFE_RE = re.compile(r"<[^>]*>")
 _DB_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -208,6 +211,9 @@ class PlexZaprosBot(Plugin):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._poll_task: Optional[asyncio.Task] = None
+        self._plex_session: Optional[aiohttp.ClientSession] = None
+        self._interactive_plex: int = 0
+        self._interactive_plex_lock = asyncio.Lock()
         self._dm_rooms: dict[str, str] = {}
         self._room_labels: dict[str, str] = {}
 
@@ -229,6 +235,12 @@ class PlexZaprosBot(Plugin):
             await self.refresh_queue_summary()
         except Exception as e:
             self.log.warning(f"Не удалось обновить снимок очереди: {e}")
+        self._plex_session = aiohttp.ClientSession(
+            loop=self.loop,
+            timeout=_PLEX_SESSION_TIMEOUT,
+            connector=aiohttp.TCPConnector(limit=8),
+            headers={"Accept": "application/json"},
+        )
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def stop(self) -> None:
@@ -238,9 +250,35 @@ class PlexZaprosBot(Plugin):
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+        if self._plex_session and not self._plex_session.closed:
+            await self._plex_session.close()
+        self._plex_session = None
 
     def _conf(self, key: str, default):
         return self.config.get(key, default)
+
+    def _plex_http(self) -> aiohttp.ClientSession:
+        if self._plex_session and not self._plex_session.closed:
+            return self._plex_session
+        return self.http
+
+    async def _wait_background_plex_idle(self) -> None:
+        """Фоновый опрос ждёт, пока не завершится интерактивный !zapros."""
+        while True:
+            async with self._interactive_plex_lock:
+                if self._interactive_plex == 0:
+                    return
+            await asyncio.sleep(0.2)
+
+    @asynccontextmanager
+    async def _interactive_plex_guard(self) -> AsyncIterator[None]:
+        async with self._interactive_plex_lock:
+            self._interactive_plex += 1
+        try:
+            yield
+        finally:
+            async with self._interactive_plex_lock:
+                self._interactive_plex -= 1
 
     def _timezone_offset_hours(self) -> float:
         try:
@@ -377,7 +415,7 @@ class PlexZaprosBot(Plugin):
         limit = int(self._conf("search_limit", 10))
         # Plex hubs/search надёжнее по одному названию; год — при выборе из выдачи
         return dict(
-            session=self.http,
+            session=self._plex_http(),
             base_url=self._plex_str("base_url", "http://127.0.0.1:32400"),
             token=self._plex_str("token", ""),
             client_identifier=self._plex_str(
@@ -690,7 +728,7 @@ class PlexZaprosBot(Plugin):
         }
         self.config["queue_summary"] = snapshot
         self.config["movie_requests"] = items
-        self.config.save()
+        await asyncio.to_thread(self.config.save)
 
     async def _purge_old_requests(self) -> None:
         days = int(self._conf("retention_days", 90))
@@ -716,6 +754,7 @@ class PlexZaprosBot(Plugin):
 
     async def _process_pending_row(self, row) -> None:
         title = row["title"]
+        await self._wait_background_plex_idle()
         try:
             movie = await self._search_plex(title)
         except PlexError as e:
@@ -839,7 +878,8 @@ class PlexZaprosBot(Plugin):
             return
         title = title.strip()
         try:
-            movies, ambiguous = await self._search_plex_interactive(title)
+            async with self._interactive_plex_guard():
+                movies, ambiguous = await self._search_plex_interactive(title)
         except PlexError as e:
             await evt.respond(str(e))
             return
