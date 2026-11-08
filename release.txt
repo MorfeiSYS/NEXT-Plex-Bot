@@ -1,9 +1,0 @@
-1.0.34 — карточки модерации: реакции ✅/⛔ от бота (с паузой matrix_send_pause_seconds).
-1.0.33 — list/модерация: без автоподсказок и автопроставления реакций; пауза matrix_send_pause_seconds и повтор при 429.
-1.0.32 — модерация: статус awaiting_approval до одобрения; карточки операторам с ✅/⛔ (реакция или !zapros accept|reject <id>); list с карточками на запись; релизы в build/.
-1.0.31 — снятие патча UI Database из v1.0.30: снова видна sqlite_sequence, стандартные SELECT * … LIMIT 100.
-1.0.29 — daily_found_requests_per_user_max: диапазон 0–1000 (значение 5 и др. не поднимается до 100); found/pending без дублей — times_requested; повтор !zapros обновляет ту же строку.
-1.0.28 — миграция БД v4: ADD COLUMN found_request_count совместима со SQLite (без IF NOT EXISTS).
-1.0.27 — daily_requests_per_user_max только для новых pending (не найден на Plex); daily_found_requests_per_user_max (100–1000) для «найден на Plex»; отдельный счётчик found_request_count в БД.
-1.0.26 — daily_requests_per_user_max: суточный лимит !zapros на пользователя (календарные сутки по timezone_offset_hours); операторы notify_users без лимита; таблица zapros_daily_usage.
-1.0.25 — config.save() вызывается в event loop Maubot (без asyncio.to_thread); устранён RuntimeError «no running event loop» после !zapros при обновлении queue_summary.

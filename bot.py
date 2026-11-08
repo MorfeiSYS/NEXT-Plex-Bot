@@ -10,7 +10,7 @@ from typing import AsyncIterator, Optional, Type
 
 import aiohttp
 from maubot import Plugin, MessageEvent
-from maubot.handlers import command, event
+from maubot.handlers import event
 from maubot.matrix import parse_formatted
 from mautrix.errors.request import MLimitExceeded
 from mautrix.types import (
@@ -30,6 +30,7 @@ from plex import (
     PlexMovie,
     normalize_title,
     parse_movie_query,
+    sanitize_plex_search_query,
     search_movie,
     search_movie_items,
 )
@@ -40,6 +41,8 @@ _TITLE_QUOTED_YEAR_SUFFIX_RE = re.compile(
     r'^["\']([^"\']+)["\'](\s*\(\d{4}\)|\s+\d{4})\s*$'
 )
 _ZAPROS_DUP_RE = re.compile(r"!zapros\b", re.IGNORECASE)
+_ZAPROS_MSG_RE = re.compile(r"^!zapros(?:\s+([\s\S]*))?\s*$", re.IGNORECASE)
+_MATRIX_SPACE_RE = re.compile(r"[\u00a0\u1680\u2000-\u200b\u202f\u205f\u3000]+")
 _PLEX_SESSION_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45)
 _DB_DISPLAY_UNSAFE_RE = re.compile(r"<[^>]*>")
 _DB_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -50,6 +53,10 @@ _MOD_REJECT_KEYS = frozenset({"⛔", "⛔️", "🚫", "no_entry", "👎", "👎
 _MOD_CMD_RE = re.compile(
     r"^(accept|approve|reject|deny)\s+(\d+)\s*$", re.IGNORECASE
 )
+
+
+def _normalize_matrix_spaces(text: str) -> str:
+    return _MATRIX_SPACE_RE.sub(" ", text)
 
 
 def _restore_maubot_database_ui() -> None:
@@ -747,15 +754,19 @@ class PlexZaprosBot(Plugin):
 
     def _parse_movie_title(self, body: str) -> Optional[str]:
         body = body.strip()
+        if not body:
+            return None
         m = _TITLE_QUOTED_YEAR_SUFFIX_RE.match(body)
         if m:
-            return f"{m.group(1).strip()}{m.group(2)}"
+            title = f"{m.group(1).strip()}{m.group(2)}"
+            return sanitize_plex_search_query(title) or None
         m = _TITLE_QUOTED_RE.match(body)
         if m:
-            return (m.group(1) or m.group(2) or "").strip()
-        if body and not body.lower().startswith("list"):
-            return body
-        return None
+            title = (m.group(1) or m.group(2) or "").strip()
+            return sanitize_plex_search_query(title) or None
+        if body.lower().startswith("list"):
+            return None
+        return sanitize_plex_search_query(body) or None
 
     def _search_results_max(self) -> int:
         try:
@@ -909,10 +920,13 @@ class PlexZaprosBot(Plugin):
         return None
 
     def _format_movies_table(self, movies: list[PlexMovie], requested: str) -> str:
-        lines = [f"Найдено несколько похожих фильмов для «{requested}»:", ""]
+        lines = [
+            f"Найдено несколько похожих фильмов/сериалов для «{requested}»:",
+            "",
+        ]
         for i, m in enumerate(movies, 1):
             year = str(m.year) if m.year else "—"
-            lines.append(f"{i}. {m.title} ({year})")
+            lines.append(f"{i}. [{m.kind_ru()}] {m.title} ({year})")
         lines.extend(
             [
                 "",
@@ -924,15 +938,15 @@ class PlexZaprosBot(Plugin):
     def _format_found(self, movie: PlexMovie, requested: str) -> str:
         year = f" ({movie.year})" if movie.year else ""
         return (
-            f"✅ Фильм «{movie.title}»{year} найден на Plex "
+            f"✅ {movie.kind_ru()} «{movie.title}»{year} найден на Plex "
             f"(запрос: «{requested}»)."
         )
 
     def _format_found_later(self, movie: PlexMovie, requested: str) -> str:
         year = f" ({movie.year})" if movie.year else ""
         return (
-            f"✅ Запрошенный фильм «{requested}» теперь есть на Plex: "
-            f"«{movie.title}»{year}."
+            f"✅ Запрошенный контент «{requested}» теперь есть на Plex: "
+            f"{movie.kind_ru()} «{movie.title}»{year}."
         )
 
     async def _record_found(
@@ -1447,9 +1461,20 @@ class PlexZaprosBot(Plugin):
             hours = float(self._conf("poll_interval_hours", 6))
             await asyncio.sleep(max(60.0, hours * 3600.0))
 
-    @command.new("zapros", require_subcommand=False)
-    @command.argument("body", pass_raw=True, required=False)
-    async def zapros_cmd(self, evt: MessageEvent, body: Optional[str]) -> None:
+    @event.on(EventType.ROOM_MESSAGE)
+    async def on_zapros_message(self, evt: MessageEvent) -> None:
+        if str(evt.sender) == str(self.client.mxid):
+            return
+        if evt.content.msgtype != MessageType.TEXT:
+            return
+        body_raw = evt.content.body or ""
+        if not body_raw.startswith("!"):
+            return
+        norm = _normalize_matrix_spaces(body_raw).strip()
+        m = _ZAPROS_MSG_RE.match(norm)
+        if not m:
+            return
+        body = (m.group(1) or "").strip() or None
         self.log.info(
             f"!zapros от {evt.sender} в {evt.room_id}: {(body or '')[:80]!r}"
         )
@@ -1471,13 +1496,13 @@ class PlexZaprosBot(Plugin):
         raw = (body or "").strip()
         if not raw:
             await evt.respond(
-                'Использование: !zapros "Название" или "Название 2020" / "Название (2020)"'
+                'Использование: !zapros "Матрица" или !zapros "Матрица 1999" / "Матрица (1999)"'
             )
             return
         if _ZAPROS_DUP_RE.search(raw):
             await evt.respond(
                 "Некорректный запрос: в сообщении повторяется команда !zapros. "
-                'Отправьте один запрос, например: !zapros "Название фильма"'
+                'Отправьте один запрос, например: !zapros "Матрица 1999"'
             )
             return
         if raw.lower() == "list" or raw.lower().startswith("list "):
@@ -1502,7 +1527,9 @@ class PlexZaprosBot(Plugin):
             return
         title = self._parse_movie_title(raw)
         if not title:
-            await evt.respond('Укажите название в кавычках: !zapros "Название фильма"')
+            await evt.respond(
+                'Укажите название, например: !zapros "Матрица" или !zapros Матрица 1999'
+            )
             return
         limit = self._title_max_length()
         if len(title.strip()) > limit:
@@ -1513,6 +1540,7 @@ class PlexZaprosBot(Plugin):
             return
         title = title.strip()
         requester = str(evt.sender)
+        await evt.respond(f"Ищу на Plex: «{title}»…")
         try:
             async with self._interactive_plex_guard():
                 movies, ambiguous = await self._search_plex_interactive(title)
@@ -1569,7 +1597,7 @@ class PlexZaprosBot(Plugin):
         await self._deliver(
             str(evt.sender),
             str(evt.room_id),
-            f"⛔️ Фильм «{title}» на Plex не найден. Запрос отправлен на модерацию"
+            f"⛔️ Контент «{title}» на Plex не найден. Запрос отправлен на модерацию"
             f"{f' (#{req_id})' if req_id else ''}.",
             in_room=evt,
         )
@@ -1635,7 +1663,7 @@ class PlexZaprosBot(Plugin):
             return
 
         header = (
-            f"**Запросы фильмов** (только ожидающие)\n"
+            f"**Запросы контента** (только ожидающие)\n"
             f"(до {per_user} на пользователя, до {users_max} пользователей)"
         )
         try:
