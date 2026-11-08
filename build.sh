@@ -8,8 +8,8 @@ id=$(grep -E '^\s*id:\s*' maubot.yaml | head -1 | sed -E 's/^\s*id:\s*//')
 version=$(grep -E '^\s*version:\s*' maubot.yaml | head -1 | sed -E 's/^\s*version:\s*//')
 [[ -n "$id" && -n "$version" ]] || { echo "Could not read id/version" >&2; exit 1; }
 
-mkdir -p bild
-out="bild/${id}-v${version}.mbp"
+mkdir -p build
+out="build/${id}-v${version}.mbp"
 if command -v mbc >/dev/null 2>&1; then
     echo "Using mbc build -> $out"
     if mbc build -o "$out"; then

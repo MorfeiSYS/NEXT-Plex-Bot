@@ -20,7 +20,7 @@ if (-not $id -or -not $version) {
 }
 
 $outName = "${id}-v${version}.mbp"
-$outDir = Join-Path $PSScriptRoot "bild"
+$outDir = Join-Path $PSScriptRoot "build"
 if (-not (Test-Path -LiteralPath $outDir)) {
     New-Item -ItemType Directory -Path $outDir | Out-Null
 }

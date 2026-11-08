@@ -1,6 +1,6 @@
 *.mbp
 *.mbp.zip
-bild/
+build/
 __pycache__/
 *.pyc
 .venv/

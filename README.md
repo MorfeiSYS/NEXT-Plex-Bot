@@ -25,7 +25,7 @@ Maubot-плагин для поиска фильмов на Plex Media Server и
 chmod +x build.sh && ./build.sh
 ```
 
-Архив: `bild/NEXT.plex-zapros-vX.X.X.mbp` (каталог `bild/` в `.gitignore`).
+Архив: `build/NEXT.plex-zapros-vX.X.X.mbp` (каталог `build/` в `.gitignore`).
 
 ## Установка
 
