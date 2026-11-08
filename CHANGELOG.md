@@ -7,6 +7,25 @@
 
 ## [Unreleased]
 
+## [1.0.42] - 2026-11-08
+
+### Fixed
+
+- Уведомления операторам в личку (`notify_mode: dm` / `both`): поиск DM через `m.direct` и state store, обновление `m.direct` при создании лички.
+- `reply_mode: both` — ответ в личку и в комнату запроса.
+- `notify_room` без лишних кавычек в YAML.
+
+## [1.0.41] - 2026-11-08
+
+### Added
+
+- `!zapros wait` — список заявок на модерации (`awaiting_approval`) с карточками ✅/⛔ (только операторы).
+- Суточное напоминание операторам о зависших `awaiting_approval` (`stuck_approval_hours`, `stuck_reminder_interval_hours`).
+
+### Changed
+
+- `!zapros list` — явное сообщение, если очередь `pending` пуста; в заголовке указано «ожидают на Plex».
+
 ## [1.0.40] - 2026-11-08
 
 ### Fixed

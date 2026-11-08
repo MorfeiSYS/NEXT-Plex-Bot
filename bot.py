@@ -380,6 +380,8 @@ class Config(BaseProxyConfig):
         helper.copy("daily_requests_per_user_max")
         helper.copy("daily_found_requests_per_user_max")
         helper.copy("matrix_send_pause_seconds")
+        helper.copy("stuck_approval_hours")
+        helper.copy("stuck_reminder_interval_hours")
         for key in ("queue_summary", "movie_requests"):
             if key in self:
                 helper.base[key] = self[key]
@@ -395,6 +397,7 @@ class PlexZaprosBot(Plugin):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._poll_task: Optional[asyncio.Task] = None
+        self._stuck_reminder_task: Optional[asyncio.Task] = None
         self._plex_session: Optional[aiohttp.ClientSession] = None
         self._interactive_plex: int = 0
         self._interactive_plex_lock = asyncio.Lock()
@@ -431,8 +434,16 @@ class PlexZaprosBot(Plugin):
             headers={"Accept": "application/json"},
         )
         self._poll_task = asyncio.create_task(self._poll_loop())
+        if self._stuck_reminder_interval_hours() > 0:
+            self._stuck_reminder_task = asyncio.create_task(self._stuck_reminder_loop())
 
     async def stop(self) -> None:
+        if self._stuck_reminder_task:
+            self._stuck_reminder_task.cancel()
+            try:
+                await self._stuck_reminder_task
+            except asyncio.CancelledError:
+                pass
         if self._poll_task:
             self._poll_task.cancel()
             try:
@@ -498,6 +509,12 @@ class PlexZaprosBot(Plugin):
         if explicit is not None and str(explicit).strip():
             return str(explicit).lower()
         return str(self._conf("reply_mode", "room")).lower()
+
+    def _notify_room_id(self) -> str:
+        raw = str(self._conf("notify_room", "") or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+            raw = raw[1:-1].strip()
+        return raw
 
     def _is_operator(self, evt: MessageEvent) -> bool:
         return str(evt.sender) in self._notify_users()
@@ -764,7 +781,10 @@ class PlexZaprosBot(Plugin):
         if m:
             title = (m.group(1) or m.group(2) or "").strip()
             return sanitize_plex_search_query(title) or None
-        if body.lower().startswith("list"):
+        low = body.lower()
+        if low == "list" or low.startswith("list ") or low == "wait" or low.startswith(
+            "wait "
+        ):
             return None
         return sanitize_plex_search_query(body) or None
 
@@ -794,6 +814,22 @@ class PlexZaprosBot(Plugin):
         except (TypeError, ValueError):
             n = 10
         return max(1, min(50, n))
+
+    def _stuck_approval_hours(self) -> float:
+        try:
+            h = float(self._conf("stuck_approval_hours", 24))
+        except (TypeError, ValueError):
+            h = 24.0
+        return max(1.0, min(24 * 30.0, h))
+
+    def _stuck_reminder_interval_hours(self) -> float:
+        try:
+            h = float(self._conf("stuck_reminder_interval_hours", 24))
+        except (TypeError, ValueError):
+            h = 24.0
+        if h <= 0:
+            return 0.0
+        return max(1.0, min(24 * 7.0, h))
 
     def _daily_requests_per_user_max(self) -> int:
         try:
@@ -1042,14 +1078,66 @@ class PlexZaprosBot(Plugin):
             movies = movies[: self._search_results_max()]
         return movies, ambiguous
 
-    async def _is_direct_with(self, user_id: str, room_id: str) -> bool:
+    async def _m_direct_room_ids(self, user_id: str) -> list[str]:
+        uid = str(user_id)
+        try:
+            data = await self.client.get_account_data(EventType.DIRECT)
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        raw = data.get(uid)
+        if raw is None:
+            for key, val in data.items():
+                if str(key).lower() == uid.lower():
+                    raw = val
+                    break
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            return [raw]
+        return [str(r) for r in raw if r]
+
+    async def _room_has_bot_and_user(self, room_id: str, user_id: str) -> bool:
         bot = str(self.client.mxid)
+        uid = str(user_id)
+        mxids: set[str] = set()
         try:
             members = await self.client.get_joined_members(room_id)
+            mxids = {str(m) for m in members}
         except Exception:
+            store = getattr(self.client, "state_store", None)
+            if store is not None:
+                try:
+                    members = await store.get_members(str(room_id))
+                    if members:
+                        mxids = {str(m) for m in members}
+                except Exception:
+                    pass
+        if not mxids:
             return False
-        mxids = {str(m) for m in members}
-        return len(mxids) == 2 and user_id in mxids and bot in mxids
+        return len(mxids) == 2 and uid in mxids and bot in mxids
+
+    async def _is_direct_with(self, user_id: str, room_id: str) -> bool:
+        return await self._room_has_bot_and_user(room_id, user_id)
+
+    async def _register_dm_in_m_direct(self, user_id: str, room_id: str) -> None:
+        uid = str(user_id)
+        rid = str(room_id)
+        try:
+            data = await self.client.get_account_data(EventType.DIRECT)
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        rooms = [str(r) for r in (data.get(uid) or []) if r]
+        if rid not in rooms:
+            rooms.insert(0, rid)
+        data[uid] = rooms
+        try:
+            await self.client.set_account_data(EventType.DIRECT, data)
+        except Exception as e:
+            self.log.warning(f"Не удалось обновить m.direct для {uid}: {e}")
 
     async def _room_human_label(self, room_id: str) -> str:
         rid = str(room_id)
@@ -1095,17 +1183,28 @@ class PlexZaprosBot(Plugin):
         return label
 
     async def _dm_room_for(self, user_id: str) -> Optional[str]:
-        cached = self._dm_rooms.get(user_id)
+        uid = str(user_id)
+        cached = self._dm_rooms.get(uid)
         if cached:
             return cached
+        joined: set[str] = set()
         try:
-            rooms = await self.client.get_joined_rooms()
+            joined = {str(r) for r in await self.client.get_joined_rooms()}
         except Exception:
-            return None
-        for room_id in rooms:
-            rid = str(room_id)
-            if await self._is_direct_with(user_id, rid):
-                self._dm_rooms[user_id] = rid
+            joined = set()
+        for rid in await self._m_direct_room_ids(uid):
+            if joined and rid not in joined:
+                continue
+            if await self._room_has_bot_and_user(rid, uid):
+                self._dm_rooms[uid] = rid
+                return rid
+            if joined and rid in joined:
+                self._dm_rooms[uid] = rid
+                return rid
+        for rid in sorted(joined):
+            if await self._room_has_bot_and_user(rid, uid):
+                self._dm_rooms[uid] = rid
+                await self._register_dm_in_m_direct(uid, rid)
                 return rid
         return None
 
@@ -1139,7 +1238,8 @@ class PlexZaprosBot(Plugin):
             if in_room is not None and str(in_room.sender) == user_id:
                 rid = str(in_room.room_id)
                 if await self._is_direct_with(user_id, rid):
-                    self._dm_rooms[user_id] = rid
+                    self._dm_rooms[str(user_id)] = rid
+                    await self._register_dm_in_m_direct(str(user_id), rid)
                     await in_room.respond(text, markdown=markdown)
                     return
             await self._send_dm(user_id, text, markdown=markdown)
@@ -1151,6 +1251,24 @@ class PlexZaprosBot(Plugin):
                         "Ответ отправлен в личные сообщения с ботом."
                     )
             return
+        if mode == "both":
+            sent_dm = False
+            if in_room is not None and str(in_room.sender) == user_id:
+                rid = str(in_room.room_id)
+                if await self._is_direct_with(user_id, rid):
+                    self._dm_rooms[str(user_id)] = rid
+                    await self._register_dm_in_m_direct(str(user_id), rid)
+                    await in_room.respond(text, markdown=markdown)
+                    sent_dm = True
+            if not sent_dm:
+                await self._send_dm(user_id, text, markdown=markdown)
+            if in_room is not None and not await self._is_direct_with(
+                user_id, str(in_room.room_id)
+            ):
+                await in_room.respond(text, markdown=markdown)
+            elif in_room is None:
+                await self._send_room_text(room_id, text, markdown=markdown)
+            return
         if in_room is not None:
             await in_room.respond(text, markdown=markdown)
             return
@@ -1159,21 +1277,24 @@ class PlexZaprosBot(Plugin):
     async def _send_dm(
         self, user_id: str, text: str, *, markdown: bool = True
     ) -> None:
-        room_id = await self._dm_room_for(user_id)
+        uid = str(user_id)
+        room_id = await self._dm_room_for(uid)
         if not room_id:
             room_id = await self.client.create_room(
                 preset=RoomCreatePreset.PRIVATE,
-                invitees=[user_id],
+                invitees=[uid],
                 is_direct=True,
             )
-            self._dm_rooms[user_id] = str(room_id)
+            room_id = str(room_id)
+            self._dm_rooms[uid] = room_id
+            await self._register_dm_in_m_direct(uid, room_id)
         await self._send_room_text(room_id, text, markdown=markdown)
 
     async def _operator_notify_room(
         self, request_room_id: str, requester: str
     ) -> Optional[str]:
         """Куда постить операторское уведомление; None — только личка операторам."""
-        admin_room = str(self._conf("notify_room", "") or "").strip()
+        admin_room = self._notify_room_id()
         mode = self._notify_mode()
         if mode == "fixed":
             return admin_room or None
@@ -1189,19 +1310,24 @@ class PlexZaprosBot(Plugin):
         self, body: str, request_id: int, kind: str
     ) -> None:
         for op in self._notify_users():
+            op_id = str(op)
             try:
-                dm = await self._dm_room_for(op)
+                dm = await self._dm_room_for(op_id)
                 if not dm:
                     dm = await self.client.create_room(
                         preset=RoomCreatePreset.PRIVATE,
-                        invitees=[op],
+                        invitees=[op_id],
                         is_direct=True,
                     )
-                    self._dm_rooms[op] = str(dm)
-                await self._send_moderation_card(str(dm), body, request_id, kind)
-                self.log.info(f"Карточка модерации #{request_id} оператору {op} (DM)")
+                    dm = str(dm)
+                    self._dm_rooms[op_id] = dm
+                    await self._register_dm_in_m_direct(op_id, dm)
+                await self._send_moderation_card(dm, body, request_id, kind)
+                self.log.info(
+                    f"Карточка модерации #{request_id} оператору {op_id} (DM {dm})"
+                )
             except Exception as e:
-                self.log.error(f"Не удалось уведомить оператора {op}: {e}")
+                self.log.error(f"Не удалось уведомить оператора {op_id}: {e}")
 
     async def _notify_operators_new_request(
         self, title: str, requester: str, room_id: str, request_id: int
@@ -1251,6 +1377,99 @@ class PlexZaprosBot(Plugin):
                     "Запрос из лички, notify_room не задан — дублируем в DM операторам"
                 )
                 await self._notify_operators_dm_card(msg, request_id, "new")
+
+    async def _notify_operators_plain(self, text: str) -> None:
+        ops = self._notify_users()
+        if not ops:
+            self.log.warning("notify_users пуст — напоминание операторам не отправлено")
+            return
+        mode = self._notify_mode()
+        admin_room = self._notify_room_id()
+
+        async def _to_room(room_id: str) -> None:
+            try:
+                await self._client_send_text_ratelimited(room_id, text)
+            except Exception as e:
+                self.log.error(f"Не удалось отправить операторам в {room_id}: {e}")
+
+        if mode == "fixed":
+            if admin_room:
+                await _to_room(admin_room)
+            return
+        if mode in ("dm", "both"):
+            for op in ops:
+                op_id = str(op)
+                try:
+                    dm = await self._dm_room_for(op_id)
+                    if not dm:
+                        dm = await self.client.create_room(
+                            preset=RoomCreatePreset.PRIVATE,
+                            invitees=[op_id],
+                            is_direct=True,
+                        )
+                        dm = str(dm)
+                        self._dm_rooms[op_id] = dm
+                        await self._register_dm_in_m_direct(op_id, dm)
+                    await self._client_send_text_ratelimited(dm, text)
+                except Exception as e:
+                    self.log.error(f"Не удалось напомнить оператору {op_id}: {e}")
+        if mode in ("room", "both") and admin_room:
+            await _to_room(admin_room)
+
+    async def _fetch_stuck_awaiting_approval(self, limit: int = 50) -> list:
+        hours = self._stuck_approval_hours()
+        cutoff = _utc_now() - timedelta(hours=hours)
+        try:
+            scheme = self.database.scheme
+        except AttributeError:
+            scheme = Scheme.POSTGRES
+        cutoff_arg = cutoff.isoformat() if scheme == Scheme.SQLITE else cutoff
+        rows = await self.database.fetch(
+            """
+            SELECT id, title, requester_id, created_at, last_checked_at,
+                   last_check_message
+            FROM movie_requests
+            WHERE status = 'awaiting_approval' AND created_at < $1
+            ORDER BY created_at ASC
+            LIMIT $2
+            """,
+            cutoff_arg,
+            limit,
+        )
+        return list(rows)
+
+    async def _send_stuck_approval_reminder(self) -> None:
+        rows = await self._fetch_stuck_awaiting_approval()
+        if not rows:
+            return
+        hours = int(self._stuck_approval_hours())
+        tz = self._timezone_offset_hours()
+        lines = [
+            f"⏳ Зависшие запросы на модерации ({len(rows)}): "
+            f"старше {hours} ч без одобрения. Команда: !zapros wait"
+        ]
+        for r in rows[:15]:
+            created = _fmt_ts_short(r["created_at"], tz) if r["created_at"] else "?"
+            lines.append(
+                f"#{r['id']} «{r['title']}» от {r['requester_id']}, созд. {created}"
+            )
+        if len(rows) > 15:
+            lines.append(f"… и ещё {len(rows) - 15}")
+        await self._notify_operators_plain("\n".join(lines))
+        self.log.info(
+            f"Напоминание операторам: {len(rows)} запрос(ов) awaiting_approval "
+            f"старше {hours} ч"
+        )
+
+    async def _stuck_reminder_loop(self) -> None:
+        await asyncio.sleep(max(60.0, self._poll_startup_seconds()))
+        while True:
+            try:
+                await self._send_stuck_approval_reminder()
+            except Exception as e:
+                self.log.exception(f"Ошибка суточного напоминания о модерации: {e}")
+            interval = self._stuck_reminder_interval_hours() * 3600.0
+            await asyncio.sleep(interval)
 
     async def _insert_pending(
         self, title: str, requester: str, room_id: str, check_message: str
@@ -1505,11 +1724,28 @@ class PlexZaprosBot(Plugin):
                 'Отправьте один запрос, например: !zapros "Матрица 1999"'
             )
             return
-        if raw.lower() == "list" or raw.lower().startswith("list "):
+        low = raw.lower()
+        if low == "list" or low.startswith("list "):
             if not self._is_operator(evt):
                 await evt.respond("Команда list доступна только операторам.")
                 return
-            await self._cmd_list(evt)
+            await self._cmd_list_queue(
+                evt,
+                status="pending",
+                header_title="Запросы контента (ожидают на Plex)",
+                empty_msg="Нет запросов в очереди pending.",
+            )
+            return
+        if low == "wait" or low.startswith("wait "):
+            if not self._is_operator(evt):
+                await evt.respond("Команда wait доступна только операторам.")
+                return
+            await self._cmd_list_queue(
+                evt,
+                status="awaiting_approval",
+                header_title="Запросы на модерации (ещё не в очереди)",
+                empty_msg="Нет запросов на модерации (awaiting_approval).",
+            )
             return
         mod_cmd = _MOD_CMD_RE.match(raw)
         if mod_cmd:
@@ -1626,7 +1862,14 @@ class PlexZaprosBot(Plugin):
             f"созд. {created}, пров. {checked}; {tail} ✅ | ⛔"
         )
 
-    async def _cmd_list(self, evt: MessageEvent) -> None:
+    async def _cmd_list_queue(
+        self,
+        evt: MessageEvent,
+        *,
+        status: str,
+        header_title: str,
+        empty_msg: str,
+    ) -> None:
         per_user = self._list_per_user_max()
         users_max = self._list_users_max()
         fetch_limit = per_user * users_max
@@ -1635,14 +1878,15 @@ class PlexZaprosBot(Plugin):
             SELECT id, title, status, requester_id, created_at, last_checked_at,
                    last_check_message, plex_title
             FROM movie_requests
-            WHERE status = 'pending'
+            WHERE status = $1
             ORDER BY created_at DESC
-            LIMIT $1
+            LIMIT $2
             """,
+            status,
             fetch_limit,
         )
         if not rows:
-            await evt.respond("Запросов пока нет.")
+            await evt.respond(empty_msg)
             return
         by_user: dict[str, list] = defaultdict(list)
         user_order: list[str] = []
@@ -1659,17 +1903,18 @@ class PlexZaprosBot(Plugin):
             shown += 1
 
         if not shown:
-            await evt.respond("Запросов пока нет.")
+            await evt.respond(empty_msg)
             return
 
         header = (
-            f"**Запросы контента** (только ожидающие)\n"
+            f"**{header_title}**\n"
             f"(до {per_user} на пользователя, до {users_max} пользователей)"
         )
+        cmd_label = "list" if status == "pending" else "wait"
         try:
             await self._respond_ratelimited(evt, header)
         except MLimitExceeded:
-            self.log.warning("!zapros list: 429 на заголовке")
+            self.log.warning(f"!zapros {cmd_label}: 429 на заголовке")
             return
         list_room = str(evt.room_id)
         for uid in user_order:
@@ -1678,12 +1923,12 @@ class PlexZaprosBot(Plugin):
                     evt, f"**{await self._requester_label(uid)}**"
                 )
             except MLimitExceeded:
-                self.log.warning("!zapros list: 429, список оборван")
+                self.log.warning(f"!zapros {cmd_label}: 429, список оборван")
                 return
             for r in by_user[uid]:
                 line = self._list_entry_line(r)
                 card = await self._send_moderation_card(
-                    list_room, line, int(r["id"]), "list"
+                    list_room, line, int(r["id"]), cmd_label
                 )
                 if card is None:
                     return

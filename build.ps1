@@ -27,6 +27,12 @@ if (-not (Test-Path -LiteralPath $outDir)) {
 $outFile = Join-Path $outDir $outName
 
 if (Get-Command mbc -ErrorAction SilentlyContinue) {
+    if (-not $env:HOME -and $env:USERPROFILE) {
+        $env:HOME = $env:USERPROFILE
+    }
+    if (-not $env:XDG_CONFIG_HOME -and $env:USERPROFILE) {
+        $env:XDG_CONFIG_HOME = Join-Path $env:USERPROFILE ".config"
+    }
     Write-Host "Using mbc build -> $outName"
     & mbc build -o $outFile
     if ($LASTEXITCODE -eq 0) {
