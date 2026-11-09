@@ -5,6 +5,10 @@ plex:
 notify_users:
   - "@operator:example.com"
 reply_mode: room
+# Префиксы команд (без !), регистр не важен; подкоманды list/wait/accept/reject общие
+command_triggers:
+  - zapros
+  # - kino
 # Куда слать уведомления о новых запросах (не найден на Plex):
 # dm — личка notify_users; room — notify_room (если задан), иначе групповая комната
 # запроса (не личка с пользователем); both — комната + личка; fixed — только notify_room

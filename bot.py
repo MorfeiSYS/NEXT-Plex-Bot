@@ -40,8 +40,7 @@ _TITLE_QUOTED_RE = re.compile(r'^"([^"]+)"\s*$|\'([^\']+)\'\s*$')
 _TITLE_QUOTED_YEAR_SUFFIX_RE = re.compile(
     r'^["\']([^"\']+)["\'](\s*\(\d{4}\)|\s+\d{4})\s*$'
 )
-_ZAPROS_DUP_RE = re.compile(r"!zapros\b", re.IGNORECASE)
-_ZAPROS_MSG_RE = re.compile(r"^!zapros(?:\s+([\s\S]*))?\s*$", re.IGNORECASE)
+_COMMAND_TRIGGER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 _MATRIX_SPACE_RE = re.compile(r"[\u00a0\u1680\u2000-\u200b\u202f\u205f\u3000]+")
 _PLEX_SESSION_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45)
 _DB_DISPLAY_UNSAFE_RE = re.compile(r"<[^>]*>")
@@ -382,6 +381,7 @@ class Config(BaseProxyConfig):
         helper.copy("matrix_send_pause_seconds")
         helper.copy("stuck_approval_hours")
         helper.copy("stuck_reminder_interval_hours")
+        helper.copy("command_triggers")
         for key in ("queue_summary", "movie_requests"):
             if key in self:
                 helper.base[key] = self[key]
@@ -405,6 +405,9 @@ class PlexZaprosBot(Plugin):
         self._room_labels: dict[str, str] = {}
         self._matrix_send_lock = asyncio.Lock()
         self._last_matrix_send: float = 0.0
+        self._cmd_triggers_cache: Optional[tuple[str, ...]] = None
+        self._cmd_msg_re: Optional[re.Pattern[str]] = None
+        self._cmd_dup_re: Optional[re.Pattern[str]] = None
 
     @classmethod
     def get_db_upgrade_table(cls) -> UpgradeTable:
@@ -419,6 +422,7 @@ class PlexZaprosBot(Plugin):
 
     async def start(self) -> None:
         self.config.load_and_update()
+        self._compile_command_patterns()
         try:
             await self._purge_old_requests()
         except Exception as e:
@@ -456,6 +460,47 @@ class PlexZaprosBot(Plugin):
 
     def _conf(self, key: str, default):
         return self.config.get(key, default)
+
+    def _command_triggers(self) -> list[str]:
+        raw = self._conf("command_triggers", None)
+        default = ["zapros"]
+        if not isinstance(raw, (list, tuple)):
+            return default
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            t = item.strip().lower()
+            if not t or t in seen:
+                continue
+            if not _COMMAND_TRIGGER_RE.fullmatch(t):
+                continue
+            seen.add(t)
+            out.append(t)
+        return out if out else default
+
+    def _primary_command(self) -> str:
+        return self._command_triggers()[0]
+
+    def _cmd_prefix(self) -> str:
+        return f"!{self._primary_command()}"
+
+    def _compile_command_patterns(self) -> None:
+        triggers = tuple(self._command_triggers())
+        if self._cmd_triggers_cache == triggers and self._cmd_msg_re is not None:
+            return
+        self._cmd_triggers_cache = triggers
+        alt = "|".join(re.escape(t) for t in triggers)
+        self._cmd_msg_re = re.compile(
+            rf"^!({alt})(?:\s+([\s\S]*))?\s*$", re.IGNORECASE
+        )
+        self._cmd_dup_re = re.compile(rf"\b!(?:{alt})\b", re.IGNORECASE)
+
+    def _ensure_command_patterns(self) -> None:
+        triggers = tuple(self._command_triggers())
+        if self._cmd_triggers_cache != triggers:
+            self._compile_command_patterns()
 
     def _plex_http(self) -> aiohttp.ClientSession:
         if self._plex_session and not self._plex_session.closed:
@@ -966,7 +1011,8 @@ class PlexZaprosBot(Plugin):
         lines.extend(
             [
                 "",
-                'Уточните запрос, напр.: !zapros "Матрица 1999" или "Матрица (1999)".',
+                f'Уточните запрос, напр.: {self._cmd_prefix()} "Матрица 1999" '
+                f'или "Матрица (1999)".',
             ]
         )
         return "\n".join(lines)
@@ -1446,7 +1492,7 @@ class PlexZaprosBot(Plugin):
         tz = self._timezone_offset_hours()
         lines = [
             f"⏳ Зависшие запросы на модерации ({len(rows)}): "
-            f"старше {hours} ч без одобрения. Команда: !zapros wait"
+            f"старше {hours} ч без одобрения. Команда: {self._cmd_prefix()} wait"
         ]
         for r in rows[:15]:
             created = _fmt_ts_short(r["created_at"], tz) if r["created_at"] else "?"
@@ -1690,19 +1736,26 @@ class PlexZaprosBot(Plugin):
         if not body_raw.startswith("!"):
             return
         norm = _normalize_matrix_spaces(body_raw).strip()
-        m = _ZAPROS_MSG_RE.match(norm)
+        self._ensure_command_patterns()
+        msg_re = self._cmd_msg_re
+        if msg_re is None:
+            return
+        m = msg_re.match(norm)
         if not m:
             return
-        body = (m.group(1) or "").strip() or None
+        cmd_name = (m.group(1) or "").lower()
+        body = (m.group(2) or "").strip() or None
         self.log.info(
-            f"!zapros от {evt.sender} в {evt.room_id}: {(body or '')[:80]!r}"
+            f"!{cmd_name} от {evt.sender} в {evt.room_id}: {(body or '')[:80]!r}"
         )
         try:
             await self._zapros_cmd(evt, body)
         except MLimitExceeded:
-            self.log.warning("!zapros: лимит запросов homeserver (429), ответ не отправлен")
+            self.log.warning(
+                f"!{cmd_name}: лимит запросов homeserver (429), ответ не отправлен"
+            )
         except Exception as e:
-            self.log.exception(f"Ошибка при обработке !zapros: {e}")
+            self.log.exception(f"Ошибка при обработке !{cmd_name}: {e}")
             try:
                 await self._respond_ratelimited(
                     evt,
@@ -1712,16 +1765,20 @@ class PlexZaprosBot(Plugin):
                 self.log.warning("Не удалось отправить ответ об ошибке: 429")
 
     async def _zapros_cmd(self, evt: MessageEvent, body: Optional[str]) -> None:
+        self._ensure_command_patterns()
+        pfx = self._cmd_prefix()
         raw = (body or "").strip()
         if not raw:
             await evt.respond(
-                'Использование: !zapros "Матрица" или !zapros "Матрица 1999" / "Матрица (1999)"'
+                f'Использование: {pfx} "Матрица" или {pfx} "Матрица 1999" / '
+                f'"Матрица (1999)"'
             )
             return
-        if _ZAPROS_DUP_RE.search(raw):
+        dup_re = self._cmd_dup_re
+        if dup_re is not None and dup_re.search(raw):
             await evt.respond(
-                "Некорректный запрос: в сообщении повторяется команда !zapros. "
-                'Отправьте один запрос, например: !zapros "Матрица 1999"'
+                f"Некорректный запрос: в сообщении повторяется команда ({pfx}). "
+                f'Отправьте один запрос, например: {pfx} "Матрица 1999"'
             )
             return
         low = raw.lower()
@@ -1764,7 +1821,7 @@ class PlexZaprosBot(Plugin):
         title = self._parse_movie_title(raw)
         if not title:
             await evt.respond(
-                'Укажите название, например: !zapros "Матрица" или !zapros Матрица 1999'
+                f'Укажите название, например: {pfx} "Матрица" или {pfx} Матрица 1999'
             )
             return
         limit = self._title_max_length()

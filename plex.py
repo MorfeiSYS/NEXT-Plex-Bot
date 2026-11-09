@@ -314,11 +314,6 @@ def classify_search_results(
             return year_hits, False
         if len(year_hits) > 1:
             return year_hits, True
-        show_similar = [m for m in similar if m.media_type == "show"]
-        if show_similar:
-            if len(show_similar) == 1:
-                return show_similar, False
-            return show_similar, True
         return [], False
 
     if len(similar) > 1:
