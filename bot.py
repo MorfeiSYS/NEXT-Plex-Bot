@@ -6,11 +6,11 @@ import re
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Optional, Type
+from typing import AsyncIterator, Awaitable, Optional, Type
 
 import aiohttp
 from maubot import Plugin, MessageEvent
-from maubot.handlers import event
+from maubot.handlers import command, event
 from maubot.matrix import parse_formatted
 from mautrix.errors.request import MLimitExceeded
 from mautrix.types import (
@@ -49,11 +49,6 @@ _PLUGIN_ID = "NEXT.plex-zapros"
 _maubot_db_ui_revert_done = False
 _MOD_ACCEPT_KEYS = frozenset({"✅", "✅️", "☑️", "👍", "👍️", "white_check_mark"})
 _MOD_REJECT_KEYS = frozenset({"⛔", "⛔️", "🚫", "no_entry", "👎", "👎️"})
-_MOD_CMD_RE = re.compile(
-    r"^(accept|approve|reject|deny)\s+(\d+)\s*$", re.IGNORECASE
-)
-
-
 def _normalize_matrix_spaces(text: str) -> str:
     return _MATRIX_SPACE_RE.sub(" ", text)
 
@@ -406,7 +401,6 @@ class PlexZaprosBot(Plugin):
         self._matrix_send_lock = asyncio.Lock()
         self._last_matrix_send: float = 0.0
         self._cmd_triggers_cache: Optional[tuple[str, ...]] = None
-        self._cmd_msg_re: Optional[re.Pattern[str]] = None
         self._cmd_dup_re: Optional[re.Pattern[str]] = None
 
     @classmethod
@@ -419,6 +413,14 @@ class PlexZaprosBot(Plugin):
 
     async def pre_start(self) -> None:
         _restore_maubot_database_ui()
+        self.client.add_event_middleware(
+            EventType.ROOM_MESSAGE, self._normalize_command_body_middleware
+        )
+
+    async def pre_stop(self) -> None:
+        self.client.remove_event_middleware(
+            EventType.ROOM_MESSAGE, self._normalize_command_body_middleware
+        )
 
     async def start(self) -> None:
         self.config.load_and_update()
@@ -488,13 +490,10 @@ class PlexZaprosBot(Plugin):
 
     def _compile_command_patterns(self) -> None:
         triggers = tuple(self._command_triggers())
-        if self._cmd_triggers_cache == triggers and self._cmd_msg_re is not None:
+        if self._cmd_triggers_cache == triggers and self._cmd_dup_re is not None:
             return
         self._cmd_triggers_cache = triggers
         alt = "|".join(re.escape(t) for t in triggers)
-        self._cmd_msg_re = re.compile(
-            rf"^!({alt})(?:\s+([\s\S]*))?\s*$", re.IGNORECASE
-        )
         self._cmd_dup_re = re.compile(rf"\b!(?:{alt})\b", re.IGNORECASE)
 
     def _ensure_command_patterns(self) -> None:
@@ -1726,30 +1725,21 @@ class PlexZaprosBot(Plugin):
             hours = float(self._conf("poll_interval_hours", 6))
             await asyncio.sleep(max(60.0, hours * 3600.0))
 
-    @event.on(EventType.ROOM_MESSAGE)
-    async def on_zapros_message(self, evt: MessageEvent) -> None:
+    async def _normalize_command_body_middleware(self, evt: MessageEvent) -> bool:
         if str(evt.sender) == str(self.client.mxid):
-            return
+            return True
         if evt.content.msgtype != MessageType.TEXT:
-            return
+            return True
         body_raw = evt.content.body or ""
-        if not body_raw.startswith("!"):
-            return
-        norm = _normalize_matrix_spaces(body_raw).strip()
-        self._ensure_command_patterns()
-        msg_re = self._cmd_msg_re
-        if msg_re is None:
-            return
-        m = msg_re.match(norm)
-        if not m:
-            return
-        cmd_name = (m.group(1) or "").lower()
-        body = (m.group(2) or "").strip() or None
-        self.log.info(
-            f"!{cmd_name} от {evt.sender} в {evt.room_id}: {(body or '')[:80]!r}"
-        )
+        if body_raw.startswith("!"):
+            evt.content.body = _normalize_matrix_spaces(body_raw).strip()
+        return True
+
+    async def _zapros_invoke(
+        self, evt: MessageEvent, cmd_name: str, action: Awaitable[None]
+    ) -> None:
         try:
-            await self._zapros_cmd(evt, body)
+            await action
         except MLimitExceeded:
             self.log.warning(
                 f"!{cmd_name}: лимит запросов homeserver (429), ответ не отправлен"
@@ -1763,6 +1753,81 @@ class PlexZaprosBot(Plugin):
                 )
             except MLimitExceeded:
                 self.log.warning("Не удалось отправить ответ об ошибке: 429")
+
+    @command.new(
+        name=lambda self: self._primary_command(),
+        aliases=lambda self, val: val in self._command_triggers(),
+        help="Поиск в Plex; модерация для операторов",
+        require_subcommand=False,
+        arg_fallthrough=False,
+        must_consume_args=False,
+    )
+    @command.argument("query", pass_raw=True, required=False)
+    async def zapros(self, evt: MessageEvent, query: Optional[str] = None) -> None:
+        cmd = self._primary_command()
+        body = (query or "").strip() or None
+        self.log.info(
+            f"!{cmd} от {evt.sender} в {evt.room_id}: {(body or '')[:80]!r}"
+        )
+        await self._zapros_invoke(evt, cmd, self._zapros_cmd(evt, body))
+
+    @zapros.subcommand("list", help="Очередь pending (только операторы)")
+    async def zapros_list(self, evt: MessageEvent) -> None:
+        if not self._is_operator(evt):
+            await evt.respond("Команда list доступна только операторам.")
+            return
+        await self._zapros_invoke(
+            evt,
+            "list",
+            self._cmd_list_queue(
+                evt,
+                status="pending",
+                header_title="Запросы контента (ожидают на Plex)",
+                empty_msg="Нет запросов в очереди pending.",
+            ),
+        )
+
+    @zapros.subcommand("wait", help="Заявки на модерации (только операторы)")
+    async def zapros_wait(self, evt: MessageEvent) -> None:
+        if not self._is_operator(evt):
+            await evt.respond("Команда wait доступна только операторам.")
+            return
+        await self._zapros_invoke(
+            evt,
+            "wait",
+            self._cmd_list_queue(
+                evt,
+                status="awaiting_approval",
+                header_title="Запросы на модерации (ещё не в очереди)",
+                empty_msg="Нет запросов на модерации (awaiting_approval).",
+            ),
+        )
+
+    @zapros.subcommand("accept", help="Одобрить заявку", aliases=("approve",))
+    @command.argument("request_id", matches=r"\d+")
+    async def zapros_accept(self, evt: MessageEvent, request_id: str) -> None:
+        if not self._is_operator(evt):
+            await evt.respond("Команды accept/reject доступны только операторам.")
+            return
+        req_id = int(request_id)
+        await self._zapros_invoke(
+            evt,
+            "accept",
+            self._moderation_accept(req_id, str(evt.sender), evt),
+        )
+
+    @zapros.subcommand("reject", help="Отклонить заявку", aliases=("deny",))
+    @command.argument("request_id", matches=r"\d+")
+    async def zapros_reject(self, evt: MessageEvent, request_id: str) -> None:
+        if not self._is_operator(evt):
+            await evt.respond("Команды accept/reject доступны только операторам.")
+            return
+        req_id = int(request_id)
+        await self._zapros_invoke(
+            evt,
+            "reject",
+            self._moderation_reject(req_id, str(evt.sender), evt),
+        )
 
     async def _zapros_cmd(self, evt: MessageEvent, body: Optional[str]) -> None:
         self._ensure_command_patterns()
@@ -1780,43 +1845,6 @@ class PlexZaprosBot(Plugin):
                 f"Некорректный запрос: в сообщении повторяется команда ({pfx}). "
                 f'Отправьте один запрос, например: {pfx} "Матрица 1999"'
             )
-            return
-        low = raw.lower()
-        if low == "list" or low.startswith("list "):
-            if not self._is_operator(evt):
-                await evt.respond("Команда list доступна только операторам.")
-                return
-            await self._cmd_list_queue(
-                evt,
-                status="pending",
-                header_title="Запросы контента (ожидают на Plex)",
-                empty_msg="Нет запросов в очереди pending.",
-            )
-            return
-        if low == "wait" or low.startswith("wait "):
-            if not self._is_operator(evt):
-                await evt.respond("Команда wait доступна только операторам.")
-                return
-            await self._cmd_list_queue(
-                evt,
-                status="awaiting_approval",
-                header_title="Запросы на модерации (ещё не в очереди)",
-                empty_msg="Нет запросов на модерации (awaiting_approval).",
-            )
-            return
-        mod_cmd = _MOD_CMD_RE.match(raw)
-        if mod_cmd:
-            if not self._is_operator(evt):
-                await evt.respond(
-                    "Команды accept/reject доступны только операторам."
-                )
-                return
-            verb = mod_cmd.group(1).lower()
-            req_id = int(mod_cmd.group(2))
-            if verb in ("accept", "approve"):
-                await self._moderation_accept(req_id, str(evt.sender), evt)
-            else:
-                await self._moderation_reject(req_id, str(evt.sender), evt)
             return
         title = self._parse_movie_title(raw)
         if not title:

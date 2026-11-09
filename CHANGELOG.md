@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [1.0.44] - 2026-11-09
+
+### Changed
+
+- Команды `!zapros` и алиасы из `command_triggers` переведены на maubot `@command.new` (подкоманды `list` / `wait` / `accept` / `reject`); плагин **NEXT-Maubot-helper** (`!help`) видит эти команды.
+- Нормализация unicode-пробелов в тексте команд — через middleware `ROOM_MESSAGE` (до разбора `@command.new`).
+
 ## [1.0.43] - 2026-11-09
 
 ### Added

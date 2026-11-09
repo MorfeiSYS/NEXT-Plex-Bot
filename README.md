@@ -33,7 +33,8 @@ chmod +x build.sh && ./build.sh
 
 1. Загрузите `.mbp` в [менеджер Maubot](https://docs.mau.fi/maubot/usage/basic.html).
 2. Создайте client и instance, привяжите к комнате.
-3. В config инстанса задайте:
+3. Справка `!help` ([NEXT-Maubot-helper](https://github.com/MorfeiSYS/NEXT-Maubot-helper)) перечисляет команды всех плагинов **на том же maubot Client** (один Matrix MXID); для `!zapros` нужен инстанс Plex и helper на одном клиенте.
+4. В config инстанса задайте:
 
 | Поле | Описание |
 |------|----------|
